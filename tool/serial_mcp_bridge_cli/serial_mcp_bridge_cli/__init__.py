@@ -1,0 +1,1 @@
+"""Serial Bridge MCP CLI package."""

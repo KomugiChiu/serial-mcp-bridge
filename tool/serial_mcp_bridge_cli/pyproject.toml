@@ -1,0 +1,19 @@
+[project]
+name = "serial-mcp-bridge-cli"
+version = "0.1.0"
+description = "Command wrapper to launch the Serial Broadcast Bridge MCP Server"
+requires-python = ">=3.10"
+dependencies = [
+    "pyserial>=3.5",
+    "mcp<2",
+]
+
+[project.scripts]
+serial-mcp-bridge = "serial_mcp_bridge_cli.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["serial_mcp_bridge_cli"]
