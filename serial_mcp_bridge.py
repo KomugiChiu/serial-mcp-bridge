@@ -46,7 +46,8 @@ except ImportError:
 # ============================================================
 serial_conn: Optional[serial.Serial] = None
 serial_lock = threading.Lock()
-history = deque(maxlen=1000)          # 歷史紀錄，給新連線者看
+history = deque(maxlen=1000)          # 歷史紀錄，給新連線者看（可用 --no-history 停用）
+enable_history = True               # 是否紀錄歷史，由啟動參數 --no-history 控制
 tcp_clients = []                      # User 的 TCP 連線清單
 tcp_clients_lock = threading.Lock()
 pending_echo = bytearray()            # 剛送出給設備的字元，供 echo 去重複
@@ -58,7 +59,7 @@ def log(msg: str, to_history: bool = True):
     timestamp = datetime.now().strftime("%H:%M:%S")
     line = f"[{timestamp}] {msg}"
     print(line, file=sys.stderr, flush=True)
-    if to_history:
+    if to_history and enable_history:
         history.append(line)
 
 
@@ -222,7 +223,7 @@ def tcp_bridge(listen_host: str, listen_port: int):
 def handle_tcp_client(conn, addr):
     log(f"[SYS] User 連線 {addr} (目前 {len(tcp_clients)+1} 個)")
     try:
-        if history:
+        if enable_history and history:
             conn.sendall(("\n".join(history) + "\n").encode('utf-8', errors='replace'))
         conn.sendall("--- 已連線，可輸入指令，AI/人的操作會互相廣播 ---\n".encode('utf-8'))
     except Exception:
@@ -390,6 +391,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         return _text("📭 找不到任何 Serial Ports")
 
     elif name == "serial_get_history":
+        if not enable_history:
+            return _text("📭 歷史紀錄功能已停用（啟動時加了 --no-history）")
         lines = arguments.get("lines", 50)
         recent = list(history)[-lines:]
         if recent:
@@ -430,13 +433,18 @@ def main():
     parser.add_argument("--tcp", "-t", type=int, default=7001, help="User TCP/telnet 埠 (預設 7001)")
     parser.add_argument("--tcphost", default="0.0.0.0", help="TCP 綁定 IP（User 用）")
     parser.add_argument("--auto-connect", action="store_true", help="啟動時自動連 serial")
+    parser.add_argument("--no-history", action="store_true", help="停用歷史紀錄：不記 history、新 TCP 連線不補歷史、serial_get_history 回報停用（即時廣播不受影響）")
     args = parser.parse_args()
+
+    global enable_history
+    enable_history = not args.no_history
 
     print("=" * 62, file=sys.stderr)
     print(" Serial Broadcast Bridge MCP Server (stdio)", file=sys.stderr)
     print(f"  Serial : {args.port or '(未指定，用 serial_connect)'} @ {args.baud}", file=sys.stderr)
     print(f"  User   : telnet/raw {args.tcphost}:{args.tcp}", file=sys.stderr)
     print("  兩方可同時連線，操作互相廣播，Device 回應廣播給所有人", file=sys.stderr)
+    print(f"  歷史紀錄: {'停用 (--no-history，即時廣播不受影響)' if args.no_history else '啟用'}", file=sys.stderr)
     print("=" * 62, file=sys.stderr)
     sys.stderr.flush()
 
