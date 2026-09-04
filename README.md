@@ -44,6 +44,7 @@ python serial_mcp_bridge.py --port /dev/ttyUSB0 --baud 115200 --auto-connect
 - `--auto-connect` 啟動時自動連指定的 port
 - `--no-history` 停用歷史紀錄（不記 history、新 TCP 不補歷史；即時廣播不受影響）
 - `--log-file` 持久化 log 到檔案（append），例：`--log-file serial.log`
+- `--line-ending {crlf,lf,cr}` 送出的換行字元（預設 `lf`；少數需要 CRLF 的設備請用 `crlf`；TCP user 輸入也會按此正規化）
 
 > 注意：MCP 走 **stdio**，因此輸出 log 一律寫到 stderr，請勿把 stdout 拿去印其他東西（會污染 MCP JSON-RPC 通道）。
 
@@ -85,8 +86,8 @@ AI 連上（stdio）後可使用以下工具：
 |------|------|
 | `serial_connect(port, baudrate, ...)` | 連接到 Serial Port（全部 AI/User 共用） |
 | `serial_disconnect()` | 斷開 Serial Port |
-| `serial_write(data, encoding, append_crlf)` | 寫入資料（broadcast 給所有 User/AI） |
-| `serial_write_read(data, encoding, append_crlf, wait_ms)` | 送指令後等回應（先清待讀再寫，問答式設備用） |
+| `serial_write(data, encoding, append_crlf, line_ending)` | 寫入資料（broadcast 給所有 User/AI；`line_ending` 未指定跟 server `--line-ending`） |
+| `serial_write_read(data, encoding, append_crlf, line_ending, wait_ms)` | 送指令後等回應（先清待讀再寫，問答式設備用） |
 | `serial_read(timeout_ms)` | 讀取目前緩衝資料（統一接收緩衝，不跟讀取線程搶 port） |
 | `serial_readline(timeout_ms)` | 讀取一行（直到換行） |
 | `serial_status()` | 查看連線狀態 |
