@@ -116,7 +116,11 @@ def _rx_drain() -> bytes:
 
 
 def _rx_wait(timeout_s: float, predicate=None) -> bytes:
-    """等到 predicate(buffer) 為真或超時；回傳當下全部緩衝（不清空，由呼叫方決定）。"""
+    """等到 predicate(buffer) 為真或超時；回傳當下全部緩衝（不清空，由呼叫方決定）。
+
+    注意：回傳後再 `_rx_drain()` 有競爭（中間新資料會被順帶取走）。
+    新程式請用 `_rx_wait_and_drain()` / `_rx_take_line()` 原子版本。
+    """
     deadline = time.monotonic() + timeout_s
     with rx_cond:
         while True:
@@ -130,6 +134,57 @@ def _rx_wait(timeout_s: float, predicate=None) -> bytes:
             if remaining <= 0:
                 return b"".join(rx_buffer)
             rx_cond.wait(timeout=remaining)
+
+
+def _rx_wait_and_drain(timeout_s: float, predicate=None) -> bytes:
+    """等到 predicate 為真或超時，然後在同一把鎖內原子取走全部緩衝。
+
+    避免 `_rx_wait()` + `_rx_drain()` 兩步之間的競爭：中間到達的新資料
+    不會被意外捎帶，取走的恰為判定當下的內容（超時則取走超時當下的全部，
+    若為空回傳 b""）。
+    """
+    deadline = time.monotonic() + timeout_s
+    with rx_cond:
+        while True:
+            blob = b"".join(rx_buffer)
+            hit = bool(blob) if predicate is None else predicate(blob)
+            if hit:
+                chunks = list(rx_buffer)
+                rx_buffer.clear()
+                return b"".join(chunks)
+            if time.monotonic() >= deadline:
+                chunks = list(rx_buffer)
+                rx_buffer.clear()
+                return b"".join(chunks)
+            rx_cond.wait(timeout=max(0.0, deadline - time.monotonic()))
+
+
+def _rx_take_line(timeout_s: float) -> tuple[bytes, bool]:
+    """等一行並原子取走（同一把鎖內判定+切割+推回餘料）。
+
+    回傳 (payload, has_newline)：
+    - 有完整行：payload 為含 `\\n` 的第一行，餘料推回緩衝；
+    - 超時但有零散資料：payload 為當下全部資料（已消耗，避免卡死），has_newline=False；
+    - 超時且無資料：(b"", False)。
+    """
+    deadline = time.monotonic() + timeout_s
+    with rx_cond:
+        while True:
+            blob = b"".join(rx_buffer)
+            if b"\n" in blob:
+                rx_buffer.clear()
+                line, rest = blob.split(b"\n", 1)
+                line += b"\n"
+                if rest:
+                    rx_buffer.appendleft(rest)
+                    rx_cond.notify_all()
+                return line, True
+            if time.monotonic() >= deadline:
+                if blob:
+                    rx_buffer.clear()
+                    return blob, False
+                return b"", False
+            rx_cond.wait(timeout=max(0.0, deadline - time.monotonic()))
 
 
 def _pending_push(data: bytes):
@@ -204,6 +259,8 @@ def open_serial(port: str, baudrate: int, timeout: float = 0.1,
         return True
     except Exception as e:
         log(f"[ERR] 無法開啟 {port}: {e}")
+        # 舊連線已在上面被 close，不能留陳舊 echo/待讀給下次連線
+        _pending_clear()
         return False
 
 
@@ -288,48 +345,53 @@ def broadcast_text(data: bytes, show_as: str, to_tcp: bool = True, skip_conns=()
 
 
 def serial_reader():
-    """讀取線程：Serial -> broadcast"""
+    """讀取線程：Serial -> broadcast。
+
+    讀取時不拿 `serial_lock`：`read()` 含 timeout（預設 0.1s）是 blocking，
+    拿鎖會把 `write_serial` 擋住最多 100ms。讀寫分工固定（僅本線程讀、
+    `write_serial` 寫），pyserial 全雙工下可併發；`close/open` 併發由
+    try/except 吸收（PortNotOpenError / OSError），下輪重取 `serial_conn`。
+    """
     log("[SYS] Serial 讀取線程已啟動")
     while running:
         try:
             with serial_lock:
                 conn = serial_conn
                 is_open = conn is not None and conn.is_open
-            if not is_open:
+            if not is_open or conn is None:
                 time.sleep(0.1)
                 continue
 
             try:
-                waiting = conn.in_waiting if conn else 0
+                waiting = conn.in_waiting
             except Exception:
                 time.sleep(0.1)
                 continue
             if waiting:
-                with serial_lock:
-                    try:
-                        data = conn.read(waiting or 1)
-                    except Exception:
-                        data = b""
+                try:
+                    # 不拿鎖：blocking read 不擋 writer
+                    data = conn.read(waiting or 1)
+                except Exception:
+                    data = b""
                 if data:
                     broadcast_text(data, "Device -> ALL")
             else:
                 try:
-                    with serial_lock:
-                        try:
-                            data = conn.read(1)
-                        except Exception:
-                            data = b""
+                    try:
+                        # 不拿鎖：timeout 0.1s 期間 writer 可正常寫入
+                        data = conn.read(1)
+                    except Exception:
+                        data = b""
                     if data:
-                        with serial_lock:
+                        try:
+                            extra = conn.in_waiting
+                        except Exception:
+                            extra = 0
+                        if extra:
                             try:
-                                extra = conn.in_waiting
+                                data += conn.read(extra)
                             except Exception:
-                                extra = 0
-                            if extra:
-                                try:
-                                    data += conn.read(extra)
-                                except Exception:
-                                    pass
+                                pass
                         broadcast_text(data, "Device -> ALL")
                         continue
                 except Exception:
@@ -482,7 +544,7 @@ def _encode_write_data(data_str: str, encoding: str, append_crlf: bool, line_end
 def _normalize_user_input(data: bytes) -> bytes:
     """按 server --line-ending 正規化 TCP user 輸入的換行（PuTTY Enter 多半送 CRLF）。
 
-    預設 crlf 原樣直通；lf 模式把 CRLF/CR 轉 LF；cr 模式把 CRLF/LF 轉 CR。
+    lf 模式（預設）把 CRLF/CR 轉 LF；cr 模式把 CRLF/LF 轉 CR；crlf 原樣直通。
     """
     if default_line_ending == "lf":
         return data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
@@ -901,12 +963,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return _text(err)
         if not _is_serial_open():
             return _text("❌ Serial 未連線")
-        _rx_drain()  # 先清掉陳舊待讀，避免回傳上次殘留
+        # 問答式語義：先丟棄寫入前的陳舊待讀（期間的 spontaneous 輸出會一併丟棄，
+        # 適合問答式設備；要保留串流請改用 serial_write + serial_read）。
+        _rx_drain()
         ok = write_serial(data, source="AI")
         if not ok:
             return _text("❌ 寫入失敗（Serial 未連線）")
-        blob = _rx_wait(wait_ms / 1000.0)
-        _rx_drain()  # 取走本次回應（與 read 語義一致：消耗）
+        # 原子等待+取走：判定與清空同一把鎖，避免 wait-then-drain 競爭。
+        blob = _rx_wait_and_drain(wait_ms / 1000.0)
         if blob:
             return _text(f"📥 回應 ({len(blob)} bytes):\n{blob.decode('utf-8', errors='replace')}")
         return _text("📭 寫入成功，但等待時間內沒有回應（超時）")
@@ -915,8 +979,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         timeout_ms = arguments.get("timeout_ms", 200)
         if not _is_serial_open():
             return _text("❌ Serial 未連線")
-        _rx_wait(timeout_ms / 1000.0)
-        data = _rx_drain()
+        # 原子等待+取走（消耗語義）：與 TCP 廣播/歷史同源，不會跟讀取線程搶 port。
+        data = _rx_wait_and_drain(timeout_ms / 1000.0)
         if data:
             return _text(f"📥 收到 ({len(data)} bytes):\n{data.decode('utf-8', errors='replace')}")
         return _text("📭 沒有資料（超時）")
@@ -925,23 +989,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         timeout_ms = arguments.get("timeout_ms", 1500)
         if not _is_serial_open():
             return _text("❌ Serial 未連線")
-        _rx_wait(timeout_ms / 1000.0, predicate=lambda blob: b"\n" in blob)
-        with rx_cond:
-            if not rx_buffer:
-                return _text("📭 沒有完整一行（超時）")
-            blob = b"".join(rx_buffer)
-            rx_buffer.clear()
-        if b"\n" in blob:
-            line, rest = blob.split(b"\n", 1)
-            line += b"\n"
-            if rest:
-                with rx_cond:
-                    rx_buffer.appendleft(rest)
-                    rx_cond.notify_all()
+        # 原子取行：判定+切割+推回餘料同一把鎖；超時有零散資料則消耗回傳（避免卡死）。
+        line, has_newline = _rx_take_line(timeout_ms / 1000.0)
+        if has_newline:
             return _text(f"📥 收到一行: {line.decode('utf-8', errors='replace').strip()}")
-        if blob:
-            # 有資料但沒有換行：照舊回傳（避免卡死），行為與之前 readline 超時不同但更實用
-            return _text(f"📥 收到 (無換行, {len(blob)} bytes): {blob.decode('utf-8', errors='replace').strip()}")
+        if line:
+            return _text(f"📥 收到 (無換行, {len(line)} bytes): {line.decode('utf-8', errors='replace').strip()}")
         return _text("📭 沒有完整一行（超時）")
 
     elif name == "serial_status":

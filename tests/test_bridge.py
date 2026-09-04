@@ -142,3 +142,35 @@ def test_wants_pushback_esc():
 def test_normalize_user_input_lf():
     bridge.default_line_ending = "lf"
     assert bridge._normalize_user_input(b"a\r\nb\rc") == b"a\nb\nc"
+
+
+def test_wait_and_drain_atomic():
+    bridge._pending_clear()
+    bridge._rx_push(b"a")
+    bridge._rx_push(b"b")
+    assert bridge._rx_wait_and_drain(0.05) == b"ab"
+    assert bridge._rx_drain() == b""
+    assert bridge._rx_wait_and_drain(0.01) == b""
+
+
+def test_take_line_split_and_leftover():
+    bridge._pending_clear()
+    bridge._rx_push(b"one\ntwo\n")
+    line, has_nl = bridge._rx_take_line(0.05)
+    assert (line, has_nl) == (b"one\n", True)
+    line, has_nl = bridge._rx_take_line(0.05)
+    assert (line, has_nl) == (b"two\n", True)
+    assert bridge._rx_drain() == b""
+
+
+def test_take_line_partial_timeout_consumes():
+    bridge._pending_clear()
+    bridge._rx_push(b"frag")
+    line, has_nl = bridge._rx_take_line(0.01)
+    assert (line, has_nl) == (b"frag", False)
+    assert bridge._rx_drain() == b""
+
+
+def test_take_line_empty_timeout():
+    bridge._pending_clear()
+    assert bridge._rx_take_line(0.01) == (b"", False)
