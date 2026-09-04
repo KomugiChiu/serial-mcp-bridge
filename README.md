@@ -1,65 +1,65 @@
 # Serial Bridge MCP Server
 
-讓 **AI Agent** 與 **User（人）** 同時連接同一個 Serial Port，互看對方操作，Device 回應廣播給所有人。
+**English** | [繁體中文](README.zh-TW.md)
 
-這是 `serial_bridge.py` 的 MCP 化版本：沿用多用戶共用單一 COM port + 廣播模型的設計，
-同時提供兩條連線通道。
+Let an **AI agent** and a **user (human)** share the same serial port at the same time: each side sees what the other does, and device responses are broadcast to everyone.
 
-## 兩條連線通道
+This is the MCP-ified version of `serial_bridge.py`: it keeps the multi-user single-COM-port + broadcast design while offering two connection channels.
 
-| 通道 | 誰用 | 方式 |
-|------|------|------|
-| **MCP (stdio)** | AI Agent（例如 opencode） | opencode 以 local MCP spawn 本程式，經 stdio 交談 |
-| **TCP text bridge** | User（人） | PuTTY / MobaXterm 連 telnet/raw `[tcp-host]:7001` |
+## Two connection channels
 
-雙方共用同一個 serial port；任何一方寫入或收到 Device 回應，都會：
-- 記入共享歷史（AI 可用 `serial_get_history` 查）
-- 廣播給 User 的 TCP 連線
+| Channel | Who | How |
+|---------|-----|-----|
+| **MCP (stdio)** | AI agent (e.g. opencode) | opencode spawns this program as a local MCP and talks over stdio |
+| **TCP text bridge** | User (human) | PuTTY / MobaXterm via telnet/raw to `[tcp-host]:7001` |
 
-> 裝置 echo 去重複：User/AI 送出指令（如 `ls`）時，bridge 只記錄一次「送出的指令」，
-> 設備端 echo 回來的那份會被自動濾掉，剩餘的才是真正的執行輸出。避免 `ls` 出現兩次。
+Both sides share one serial port; whenever either side writes or the device responds:
+- it is recorded in the shared history (the AI can query it with `serial_get_history`)
+- it is broadcast to the user's TCP connection
 
-## 安裝
+> Device echo dedup: when the user/AI sends a command (e.g. `ls`), the bridge records the "sent command" only once; the copy echoed back by the device is filtered out automatically, leaving only the real output. No more duplicated `ls`.
+
+## Install
 
 ```bash
 pip install -r requirements.txt
-# 需要 Python 3.10+；切勿用 mcp>=2（API 不同，此版本未支援）
+# Requires Python 3.10+; do NOT use mcp>=2 (different API, not supported here)
 ```
 
-## 啟動
+## Start
 
 ```bash
 python serial_mcp_bridge.py --port /dev/ttyUSB0 --baud 115200
-# 自訂埠：
+# Custom port:
 python serial_mcp_bridge.py --port COM3 --baud 9600 --tcp 7001
-# 啟動即自動連 serial：
+# Auto-connect serial on startup:
 python serial_mcp_bridge.py --port /dev/ttyUSB0 --baud 115200 --auto-connect
 ```
 
-參數：
-- `--port / -p` serial port（也可不指定，之後由 AI 用 `serial_connect` 連）
-- `--baud / -b` baud rate（預設 115200）
-- `--tcp / -t` User TCP/telnet 埠（預設 7001）
-- `--tcphost` TCP 綁定 IP（預設 127.0.0.1 只聽本機；用 0.0.0.0 會暴露到 LAN，任何人可注入 serial 指令）
-- `--auto-connect` 啟動時自動連指定的 port
-- `--no-history` 停用歷史紀錄（不記 history、新 TCP 不補歷史；即時廣播不受影響）
-- `--no-tcp-history` 新 TCP 連線不補送歷史快照；歷史照常記錄，AI 的 `serial_get_history`/`search` 不受影響（即時廣播不受影響）
-- `--log-file` 持久化 log 到檔案（append），例：`--log-file serial.log`
-- `--line-ending {crlf,lf,cr}` 送出的換行字元（預設 `lf`；少數需要 CRLF 的設備請用 `crlf`；TCP user 輸入也會按此正規化）
-- `--cooked` 啟用 bridge 端行編輯（本地 echo、Up/Down 召回歷史；給沒有行編輯的 dumb shell 用，預設 raw 直通）
+Options:
+- `--port / -p` serial port (optional; the AI can connect later with `serial_connect`)
+- `--baud / -b` baud rate (default 115200)
+- `--tcp / -t` user TCP/telnet port (default 7001)
+- `--tcphost` TCP bind IP (default 127.0.0.1, localhost only; `0.0.0.0` exposes it to the LAN where anyone could inject serial commands)
+- `--auto-connect` connect the given serial port on startup
+- `--no-history` disable history: no history recording, no history replay for new TCP clients; live broadcast unaffected
+- `--no-tcp-history` skip history replay for new TCP clients; history is still recorded and the AI's `serial_get_history`/`search` keep working (live broadcast unaffected)
+- `--log-file` persist logs to a file (append), e.g. `--log-file serial.log`
+- `--line-ending {crlf,lf,cr}` line ending appended on send (default `lf`; use `crlf` for devices that need CRLF; TCP user input is normalized the same way)
+- `--cooked` bridge-side line editing (local echo, Up/Down history recall; for dumb shells with no line editing; default is raw passthrough)
 
-> 注意：MCP 走 **stdio**，因此輸出 log 一律寫到 stderr，請勿把 stdout 拿去印其他東西（會污染 MCP JSON-RPC 通道）。
+> Note: MCP runs over **stdio**, so all logs go to stderr. Never print anything else to stdout (it would corrupt the MCP JSON-RPC channel).
 
-## opencode 設定（local MCP spawn，stdio）
+## opencode setup (local MCP spawn, stdio)
 
-在本機用 `uv tool` 安裝並註冊：
+Install and register locally with `uv tool`:
 
 ```bash
 cd tool/serial_mcp_bridge_cli
 uv tool install .
 ```
 
-然後在 opencode 設定加入：
+Then add to your opencode config:
 
 ```json
 {
@@ -76,36 +76,36 @@ uv tool install .
 }
 ```
 
-`SERIAL_MCP_BRIDGE_PATH` 指向 `serial_mcp_bridge.py`，這支 CLI wrapper 需要。
+`SERIAL_MCP_BRIDGE_PATH` points to `serial_mcp_bridge.py`; the CLI wrapper needs it.
 
-重啟 opencode 後，即可用 `serial_*` tools；User 同時用 telnet/raw 連 `127.0.0.1:7001`。
+After restarting opencode, the `serial_*` tools are available; the user connects simultaneously via telnet/raw to `127.0.0.1:7001`.
 
-> 舊版 `serial_bridge.py` 已廢棄，僅留供對照，請一律使用 `serial_mcp_bridge.py`。
+> The legacy `serial_bridge.py` is deprecated and kept for reference only; always use `serial_mcp_bridge.py`.
 
-## AI 端使用（MCP tools）
+## AI usage (MCP tools)
 
-AI 連上（stdio）後可使用以下工具：
+Once connected (stdio), the AI can use these tools:
 
-| Tool | 說明 |
-|------|------|
-| `serial_connect(port, baudrate, ...)` | 連接到 Serial Port（全部 AI/User 共用） |
-| `serial_disconnect()` | 斷開 Serial Port |
-| `serial_write(data, encoding, append_crlf, line_ending)` | 寫入資料（broadcast 給所有 User/AI；`line_ending` 未指定跟 server `--line-ending`） |
-| `serial_write_read(data, encoding, append_crlf, line_ending, wait_ms)` | 送指令後等回應（先清待讀再寫，問答式設備用） |
-| `serial_read(timeout_ms)` | 讀取目前緩衝資料（統一接收緩衝，不跟讀取線程搶 port） |
-| `serial_readline(timeout_ms)` | 讀取一行（直到換行） |
-| `serial_status()` | 查看連線狀態 |
-| `serial_list_ports()` | 列出可用 Serial Ports |
-| `serial_get_history(lines)` | 取得共享歷史（看 User/AI/Device 操作） |
-| `serial_search_history(keyword, source, lines, limit)` | 搜尋歷史（按關鍵字/來源 AI/User/Device/SYS 過濾） |
-| `serial_flush(which)` | 清除緩衝區 |
+| Tool | Description |
+|------|-------------|
+| `serial_connect(port, baudrate, ...)` | Connect to the serial port (shared by all AIs/users) |
+| `serial_disconnect()` | Disconnect the serial port |
+| `serial_write(data, encoding, append_crlf, line_ending)` | Write data (broadcast to all users/AIs; `line_ending` defaults to the server's `--line-ending`) |
+| `serial_write_read(data, encoding, append_crlf, line_ending, wait_ms)` | Send a command and wait for the response (drains stale input first; for Q&A-style devices) |
+| `serial_read(timeout_ms)` | Read buffered device responses (unified receive buffer; never races the reader thread for the port) |
+| `serial_readline(timeout_ms)` | Read one line (up to newline) |
+| `serial_status()` | Show connection status |
+| `serial_list_ports()` | List available serial ports |
+| `serial_get_history(lines)` | Get recent shared history (user / AI / device activity) |
+| `serial_search_history(keyword, source, lines, limit)` | Search history (filter by keyword / source AI/User/Device/SYS) |
+| `serial_flush(which)` | Flush buffers |
 
-### 建議的 AI 操作流程
+### Suggested AI workflow
 
-1. `serial_list_ports()` 找 port
-2. `serial_connect(port=..., baudrate=...)` 連線
-3. `serial_write(data="...")` 送指令
-4. `serial_read(timeout_ms=...)` 或 `serial_get_history()` 看 Device 回應
-5. 若要「持續看輸出」，可迴圈呼叫 `serial_read` / `serial_get_history`
+1. `serial_list_ports()` to find the port
+2. `serial_connect(port=..., baudrate=...)` to connect
+3. `serial_write(data="...")` to send a command
+4. `serial_read(timeout_ms=...)` or `serial_get_history()` to see the device response
+5. To keep watching output, poll `serial_read` / `serial_get_history`
 
-> 注意：本 server 的 MCP SDK 需使用 **mcp 1.x**（`pip install "mcp<2"`）。
+> Note: this server requires MCP SDK **1.x** (`pip install "mcp<2"`).
