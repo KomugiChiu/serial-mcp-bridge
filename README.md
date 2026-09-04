@@ -19,6 +19,20 @@ Both sides share one serial port; whenever either side writes or the device resp
 
 > Device echo dedup: when the user/AI sends a command (e.g. `ls`), the bridge records the "sent command" only once; the copy echoed back by the device is filtered out automatically, leaving only the real output. No more duplicated `ls`.
 
+### User in-band commands (TCP)
+
+Lines starting with `!` at the beginning of a line are intercepted by the bridge (never sent to the device), even when typed character-by-character over telnet:
+
+| Input | Effect |
+|-------|--------|
+| `!start_log [name]` | Start writing all input/output to a log file (`--log-dir`, auto-named if omitted) |
+| `!stop_log` | Stop recording |
+| `!log_status` | Show recording status |
+| `!help` | Show this list |
+| `!!...` | Escape: sent to the device literally (`!!ls` sends `!ls`) |
+
+Start/stop events are logged to history and announced to the other side, so no one records secretly. Unknown `!xxx` is forwarded to the device untouched (plus a private hint).
+
 ## Install
 
 ```bash
@@ -45,6 +59,7 @@ Options:
 - `--no-history` disable history: no history recording, no history replay for new TCP clients; live broadcast unaffected
 - `--no-tcp-history` skip history replay for new TCP clients; history is still recorded and the AI's `serial_get_history`/`search` keep working (live broadcast unaffected)
 - `--log-file` persist logs to a file (append), e.g. `--log-file serial.log`
+- `--log-dir` directory for files started via `!start_log` / `serial_log_start` (auto-created, default `logs`; names are basenamed)
 - `--line-ending {crlf,lf,cr}` line ending appended on send (default `lf`; use `crlf` for devices that need CRLF; TCP user input is normalized the same way)
 - `--cooked` bridge-side line editing (local echo, Up/Down history recall; for dumb shells with no line editing; default is raw passthrough)
 
@@ -99,6 +114,8 @@ Once connected (stdio), the AI can use these tools:
 | `serial_get_history(lines)` | Get recent shared history (user / AI / device activity) |
 | `serial_search_history(keyword, source, lines, limit)` | Search history (filter by keyword / source AI/User/Device/SYS) |
 | `serial_flush(which)` | Flush buffers |
+| `serial_log_start(filename)` | Start writing all input/output to a log file (shared switch with `!start_log`) |
+| `serial_log_stop()` | Stop recording |
 
 ### Suggested AI workflow
 

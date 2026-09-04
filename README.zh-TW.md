@@ -21,6 +21,20 @@
 > 裝置 echo 去重複：User/AI 送出指令（如 `ls`）時，bridge 只記錄一次「送出的指令」，
 > 設備端 echo 回來的那份會被自動濾掉，剩餘的才是真正的執行輸出。避免 `ls` 出現兩次。
 
+### User 行內指令（TCP）
+
+行首 `!` 開頭的行會被 bridge 攔截（不送給設備），逐字元 telnet 照樣觸發：
+
+| 輸入 | 效果 |
+|------|------|
+| `!start_log [檔名]` | 開始把全部輸入輸出寫到 log 檔（放 `--log-dir`，省缺自動編） |
+| `!stop_log` | 停止記錄 |
+| `!log_status` | 查看記錄狀態 |
+| `!help` | 顯示本列表 |
+| `!!...` | 跳脫，原樣送設備（如 `!!ls` 送出 `!ls`） |
+
+開始/停止會記入歷史並廣播給另一方，不會有人偷錄。未知的 `!xxx` 原樣轉送設備（另加私聊提示）。
+
 ## 安裝
 
 ```bash
@@ -47,6 +61,7 @@ python serial_mcp_bridge.py --port /dev/ttyUSB0 --baud 115200 --auto-connect
 - `--no-history` 停用歷史紀錄（不記 history、新 TCP 不補歷史；即時廣播不受影響）
 - `--no-tcp-history` 新 TCP 連線不補送歷史快照；歷史照常記錄，AI 的 `serial_get_history`/`search` 不受影響（即時廣播不受影響）
 - `--log-file` 持久化 log 到檔案（append），例：`--log-file serial.log`
+- `--log-dir` `!start_log` / `serial_log_start` 開的檔放哪（自動建目錄，預設 `logs`；檔名只取 basename）
 - `--line-ending {crlf,lf,cr}` 送出的換行字元（預設 `lf`；少數需要 CRLF 的設備請用 `crlf`；TCP user 輸入也會按此正規化）
 - `--cooked` 啟用 bridge 端行編輯（本地 echo、Up/Down 召回歷史；給沒有行編輯的 dumb shell 用，預設 raw 直通）
 
@@ -101,6 +116,8 @@ AI 連上（stdio）後可使用以下工具：
 | `serial_get_history(lines)` | 取得共享歷史（看 User/AI/Device 操作） |
 | `serial_search_history(keyword, source, lines, limit)` | 搜尋歷史（按關鍵字/來源 AI/User/Device/SYS 過濾） |
 | `serial_flush(which)` | 清除緩衝區 |
+| `serial_log_start(filename)` | 開始把全部輸入輸出寫到 log 檔（與 `!start_log` 共用開關） |
+| `serial_log_stop()` | 停止記錄 |
 
 ### 建議的 AI 操作流程
 

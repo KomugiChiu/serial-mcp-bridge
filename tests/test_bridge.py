@@ -1,4 +1,4 @@
-"""serial_mcp_bridge 純邏輯單元測試（免硬體、免 mcp/pyserial 實裝，用 stub 載入）。"""
+"""Pure-logic unit tests for serial_mcp_bridge (no hardware; stub out mcp/pyserial)."""
 import importlib.util
 import sys
 import types
@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 def _load_bridge():
-    # 先塞 stub，避免 import serial / mcp 失敗
+    # Stub these first so importing serial / mcp cannot fail
     if "serial" not in sys.modules:
         serial_stub = types.ModuleType("serial")
         serial_stub.Serial = object  # type: ignore
@@ -47,7 +47,7 @@ def test_encode_utf8_lf():
 
 
 def test_encode_hex_append_crlf():
-    # P0-1 回歸：hex + append_crlf=True 必須加換行（之前直接 return 忽略）
+    # P0-1 regression: hex + append_crlf=True must append a newline (it used to return early, ignoring it)
     bridge.default_line_ending = "lf"
     data, err = bridge._encode_write_data("41 42", "hex", True, None)
     assert err == "" and data == b"AB\n", data
@@ -63,7 +63,7 @@ def test_encode_hex_invalid():
 def test_echo_exact_and_cross_chunk():
     bridge._pending_clear()
     bridge._pending_push(b"ls\n")
-    # 完整 echo + 真輸出黏在同一包，只扣前綴
+    # Full echo + real output glued in one packet: only the prefix is stripped
     out = bridge._pending_consume(b"ls\nOK\n")
     assert out == b"OK\n", out
 
@@ -76,7 +76,7 @@ def test_echo_split_packets():
 
 
 def test_echo_mismatch_dropped():
-    # 設備改寫/遺失 echo（開頭對不上）時丟 pending、不丟 data
+    # Rewritten/lost echo (mismatched head) drops pending, never data
     bridge._pending_clear()
     bridge._pending_push(b"ABC")
     assert bridge._pending_consume(b"XYZ") == b"XYZ"
@@ -136,7 +136,7 @@ def test_wants_pushback_esc():
     assert bridge._wants_pushback(b"\x1b[A") is False
     bridge.cooked_mode = True
     assert bridge._wants_pushback(b"ls") is False
-    bridge.cooked_mode = False  # 還原預設
+    bridge.cooked_mode = False  # restore default
 
 
 def test_normalize_user_input_lf():
@@ -177,7 +177,8 @@ def test_take_line_empty_timeout():
 
 
 def test_tcp_history_gate():
-    # 預設：有快照就補；--no-tcp-history 只關 TCP 補送，AI 照樣可查（history 本體不動）
+    # Default: replay when a snapshot exists; --no-tcp-history only disables TCP replay,
+    # AI queries keep working (the history itself is untouched)
     bridge.enable_history = True
     bridge.enable_tcp_history = True
     assert bridge._should_send_tcp_history(["a"]) is True
@@ -187,4 +188,175 @@ def test_tcp_history_gate():
     bridge.enable_history = False
     bridge.enable_tcp_history = True
     assert bridge._should_send_tcp_history(["a"]) is False
-    bridge.enable_history = True  # 還原預設
+    bridge.enable_history = True  # restore default
+
+
+def test_sanitize_log_name():
+    assert bridge._sanitize_log_name("a.log") == "a.log"
+    assert bridge._sanitize_log_name("../../etc/passwd") == "passwd"  # traversal -> basename only
+    assert bridge._sanitize_log_name("a/b") == "b"
+    assert bridge._sanitize_log_name("a b?.log") == "a_b_.log"
+    for bad in ("", "  ", ".", "..", "../"):
+        assert bridge._sanitize_log_name(bad) == "", bad
+
+
+def test_parse_log_command():
+    assert bridge._parse_log_command("!start_log") == ("start", "")
+    assert bridge._parse_log_command("!start_log foo.log") == ("start", "foo.log")
+    assert bridge._parse_log_command("!START") == ("start", "")
+    assert bridge._parse_log_command("!stop_log") == ("stop", "")
+    assert bridge._parse_log_command("!log_status") == ("status", "")
+    assert bridge._parse_log_command("!help") == ("help", "")
+    assert bridge._parse_log_command("!!ls") == ("escape", "!ls")
+    assert bridge._parse_log_command("!nope") == ("unknown", "!nope")
+    assert bridge._parse_log_command("!") == ("unknown", "!")
+    assert bridge._parse_log_command("ls") == ("unknown", "ls")
+
+
+def _reset_log_state():
+    try:
+        if bridge.log_fp is not None:
+            bridge.log_fp.close()
+    except Exception:
+        pass
+    bridge.log_fp = None
+    bridge.log_owner = None
+    bridge.log_name = None
+
+
+def test_logfile_start_stop(tmp_path):
+    old_dir = bridge.log_dir
+    bridge.log_dir = str(tmp_path)
+    try:
+        _reset_log_state()
+        assert bridge._logfile_start("t.log", "TEST").startswith("Recording started")
+        assert bridge._logfile_status().startswith("Recording:")
+        assert "Already recording" in bridge._logfile_start("other.log", "TEST")  # second open is refused
+        files = list(tmp_path.iterdir())
+        assert len(files) == 1 and files[0].name == "t.log"
+        assert "Recording started" in files[0].read_text(encoding="utf-8")
+        assert bridge._logfile_stop("TEST").startswith("Recording stopped")
+        assert bridge._logfile_status() == "Not recording"
+        assert bridge._logfile_stop("TEST") == "Not recording"  # stopping while idle is safe
+        auto = bridge._logfile_start("", "TEST")  # omitted name is auto-generated
+        assert auto.startswith("Recording started") and bridge.log_name.startswith("serial-")
+    finally:
+        _reset_log_state()
+        bridge.log_dir = old_dir
+
+
+class _FakeConn:
+    def __init__(self):
+        self.sent = bytearray()
+
+    def sendall(self, data):
+        self.sent += data
+
+
+def _real_processor():
+    return bridge._make_command_processor(_FakeConn(), ("127.0.0.1", 1))
+
+
+def test_command_processor_escape_and_unknown():
+    proc = _real_processor()
+    assert proc(b"!!ls\n") == b"!ls\n"  # escape goes to the device as-is
+    assert proc(b"!nope\n") == b"!nope\n"  # unknown commands are not swallowed; forwarded
+
+
+def test_command_processor_status(tmp_path):
+    old_dir = bridge.log_dir
+    bridge.log_dir = str(tmp_path)
+    try:
+        _reset_log_state()
+        conn = _FakeConn()
+        proc = bridge._make_command_processor(conn, ("127.0.0.1", 1))
+        assert proc(b"!log_status\n") == b""
+        assert "Not recording" in bytes(conn.sent).decode()
+        assert proc(b"!start_log t.log\n") == b""
+        assert proc(b"!log_status\n") == b""
+        assert "t.log" in bytes(conn.sent).decode()
+        assert proc(b"!stop_log\n") == b""
+        assert "Recording stopped" in bytes(conn.sent).decode()
+    finally:
+        _reset_log_state()
+        bridge.log_dir = old_dir
+
+
+def test_cmd_filter_passthrough():
+    bridge.cooked_mode = False
+    f = bridge.TcpCommandFilter()
+    dev, echo, consumed = f.feed(b"ls\n", lambda line: b"")
+    assert (dev, echo, consumed) == (b"ls\n", b"ls\n", False)
+    dev, echo, consumed = f.feed(b"ls !foo\n", lambda line: b"")  # mid-line ! never triggers
+    assert (dev, echo, consumed) == (b"ls !foo\n", b"ls !foo\n", False)
+    bridge.cooked_mode = False  # restore default
+
+
+def test_cmd_filter_char_at_a_time():
+    bridge.cooked_mode = False
+    f = bridge.TcpCommandFilter()
+    seen = []
+    dev_total, echo_total = b"", b""
+    for ch in b"!log_status\n":
+        dev, echo, consumed = f.feed(bytes((ch,)), lambda line: seen.append(line) or b"")
+        dev_total += dev
+        echo_total += echo
+    assert seen == [b"!log_status\n"]  # char-at-a-time still assembles a full line
+    assert echo_total == b"!log_status"  # held input echoes char-by-char; the terminating \n is consumed, reply follows
+    assert dev_total == b"" and consumed is True
+    bridge.cooked_mode = False
+
+
+def test_cmd_filter_backspace_abandons():
+    bridge.cooked_mode = False
+    f = bridge.TcpCommandFilter()
+    dev, echo, consumed = f.feed(b"!star", lambda line: b"")
+    assert dev == b"" and echo == b"!star"  # held so far
+    dev, echo, consumed = f.feed(b"\x7fmore\n", lambda line: b"")
+    assert dev == b"!star\x7fmore\n"  # backspace abandons holding; everything incl. the erase goes to the device
+    assert consumed is False
+    bridge.cooked_mode = False
+
+
+def test_filter_cooked_commands():
+    got = []
+    dev, consumed = bridge._filter_cooked_commands(b"!log_status\nls\n", lambda line: got.append(line) or b"")
+    assert got == [b"!log_status\n"] and (dev, consumed) == (b"ls\n", True)
+    dev, consumed = bridge._filter_cooked_commands(b"!sta", lambda line: b"")  # no newline, no judgement
+    assert (dev, consumed) == (b"!sta", False)
+
+
+def test_write_serial_offline_logged():
+    # Offline input must still leave a trace (monitoring without gaps), tagged (not sent)
+    bridge.enable_history = True
+    assert bridge.write_serial(b"hi\n", source="TEST") is False
+    assert any("(not sent)" in e and "hi" in e for e in bridge._history_snapshot()[-5:])
+
+
+def test_short_source():
+    assert bridge._short_source("AI -> Device") == "[_ai]"
+    assert bridge._short_source("User(('127.0.0.1', 1)) -> Device") == "[usr]"
+    assert bridge._short_source("User(('127.0.0.1', 1)) -> Device (not sent)") == "[usr]"
+    assert bridge._short_source("Device -> ALL") == "[dev]"
+
+
+def test_broadcast_tags_and_sys_normalized():
+    bridge.enable_history = True
+    bridge._pending_clear()
+    bridge.broadcast_text(b"hello\n", show_as="AI -> Device", to_tcp=False)
+    assert "[_ai] hello" in bridge._history_snapshot()[-1]
+    bridge.broadcast_text(b"oops\n", show_as="User(('127.0.0.1', 5)) -> Device (not sent)", to_tcp=False)
+    assert "[usr] oops (not sent)" in bridge._history_snapshot()[-1]
+    bridge.log("[SYS] hi")
+    assert bridge._history_snapshot()[-1].endswith("[sys] hi")
+
+
+def test_clean_log_text():
+    # Emoji/special symbols are stripped; CJK, punctuation, $, and spacing survive
+    assert bridge._clean_log_text("✅ Recording started: a.log") == "Recording started: a.log"
+    assert bridge._clean_log_text("📝 Recording: x") == "Recording: x"
+    assert bridge._clean_log_text("❌ Write failed") == "Write failed"
+    assert bridge._clean_log_text("中文測試：，。「」") == "中文測試：，。「」"  # CJK fixture: device output may contain it
+    assert bridge._clean_log_text("console:/ $ ") == "console:/ $"
+    assert bridge._clean_log_text("a  b   c") == "a  b   c"
+    assert bridge._clean_log_text("^C `ls` ok") == "^C `ls` ok"  # ASCII kept as-is
