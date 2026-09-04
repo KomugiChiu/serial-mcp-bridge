@@ -43,6 +43,7 @@ python serial_mcp_bridge.py --port /dev/ttyUSB0 --baud 115200 --auto-connect
 - `--tcphost` TCP 綁定 IP（預設 127.0.0.1 只聽本機；用 0.0.0.0 會暴露到 LAN，任何人可注入 serial 指令）
 - `--auto-connect` 啟動時自動連指定的 port
 - `--no-history` 停用歷史紀錄（不記 history、新 TCP 不補歷史；即時廣播不受影響）
+- `--no-tcp-history` 新 TCP 連線不補送歷史快照；歷史照常記錄，AI 的 `serial_get_history`/`search` 不受影響（即時廣播不受影響）
 - `--log-file` 持久化 log 到檔案（append），例：`--log-file serial.log`
 - `--line-ending {crlf,lf,cr}` 送出的換行字元（預設 `lf`；少數需要 CRLF 的設備請用 `crlf`；TCP user 輸入也會按此正規化）
 - `--cooked` 啟用 bridge 端行編輯（本地 echo、Up/Down 召回歷史；給沒有行編輯的 dumb shell 用，預設 raw 直通）

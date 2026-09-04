@@ -46,9 +46,10 @@ except ImportError:
 # ============================================================
 serial_conn: Optional[serial.Serial] = None
 serial_lock = threading.Lock()
-history = deque(maxlen=1000)          # 歷史紀錄，給新連線者看（可用 --no-history 停用）
+history = deque(maxlen=1000)          # 歷史紀錄（可用 --no-history 停用記錄；可用 --no-tcp-history 停用新 TCP 補送）
 history_lock = threading.Lock()     # 保護 history 的併發存取
 enable_history = True               # 是否紀錄歷史，由啟動參數 --no-history 控制
+enable_tcp_history = True           # 新 TCP 連線是否補送歷史快照，由 --no-tcp-history 控制（AI 的 get/search 不受影響）
 # 統一接收緩衝：只有 serial_reader 線程讀硬體，MCP 的 read/readline/write_read 都從這裡取
 rx_buffer: deque = deque()          # 每個元素是一段 bytes（Device 去 echo 後的資料）
 rx_lock = threading.Lock()
@@ -94,6 +95,16 @@ def _history_snapshot() -> list:
     """線程安全地拷貝歷史紀錄。"""
     with history_lock:
         return list(history)
+
+
+def _should_send_tcp_history(snapshot: list) -> bool:
+    """新 TCP 連線是否補送歷史快照（純函式，方便測試）。
+
+    --no-tcp-history 只關 TCP 補送：歷史照常記錄，AI 的
+    serial_get_history / serial_search_history 不受影響；即時廣播也不受影響。
+    --no-history 是總開關，關掉後本來就不補。
+    """
+    return bool(enable_history and enable_tcp_history and snapshot)
 
 
 def _rx_push(data: bytes):
@@ -443,7 +454,7 @@ def handle_tcp_client(conn, addr):
     log(f"[SYS] User 連線 {addr} (目前 {n_now} 個)")
     try:
         snapshot = _history_snapshot()
-        if enable_history and snapshot:
+        if _should_send_tcp_history(snapshot):
             conn.sendall(("\n".join(snapshot) + "\n").encode('utf-8', errors='replace'))
         conn.sendall("--- 已連線，可輸入指令，AI/人的操作會互相廣播 ---\n".encode('utf-8'))
         if cooked_mode:
@@ -1014,6 +1025,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             n_rx_chunks = len(rx_buffer)
             n_rx_bytes = sum(len(c) for c in rx_buffer)
         hist_state = "停用 (--no-history)" if not enable_history else f"啟用 ({len(_history_snapshot())} 行暫存)"
+        tcp_hist_state = "關閉 (--no-tcp-history)" if not enable_tcp_history else "啟用"
         edit_state = "cooked" if cooked_mode else "raw"
         if info is not None:
             port, baud, bytesize, parity, stopbits, in_waiting = info
@@ -1022,10 +1034,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                          f"  In Waiting (硬體): {in_waiting}\n"
                          f"  待讀緩衝: {n_rx_bytes} bytes / {n_rx_chunks} 段\n"
                          f"  歷史紀錄: {hist_state}\n"
+                         f"  TCP 補歷史: {tcp_hist_state}\n"
                          f"  行編輯: {edit_state}\n"
                          f"  TCP User: {n_tcp} 個")
         return _text(f"❌ Serial 未連接\n  待讀緩衝: {n_rx_bytes} bytes / {n_rx_chunks} 段\n"
-                     f"  歷史紀錄: {hist_state}\n  行編輯: {edit_state}\n  TCP User: {n_tcp} 個")
+                     f"  歷史紀錄: {hist_state}\n  TCP 補歷史: {tcp_hist_state}\n  行編輯: {edit_state}\n  TCP User: {n_tcp} 個")
 
     elif name == "serial_list_ports":
         from serial.tools.list_ports import comports
@@ -1102,6 +1115,8 @@ def main():
                         help="TCP 綁定 IP（User 用；預設 127.0.0.1 只聽本機。用 0.0.0.0 會暴露到 LAN，任何人可注入 serial 指令，請確認必要才用）")
     parser.add_argument("--auto-connect", action="store_true", help="啟動時自動連 serial")
     parser.add_argument("--no-history", action="store_true", help="停用歷史紀錄：不記 history、新 TCP 連線不補歷史、serial_get_history 回報停用（即時廣播不受影響）")
+    parser.add_argument("--no-tcp-history", action="store_true",
+                        help="新 TCP 連線不補送歷史快照；歷史照常記錄，AI 的 serial_get_history/search 不受影響（即時廣播不受影響）")
     parser.add_argument("--log-file", default=None, help="持久化 log 到檔案（append），例: serial.log；stderr 照常輸出")
     parser.add_argument("--line-ending", default="lf", choices=["crlf", "lf", "cr"],
                         help="送出的換行字元（預設 lf；少數需要 CRLF 的設備請用 crlf）")
@@ -1109,8 +1124,9 @@ def main():
                         help="啟用 bridge 端行編輯：本地 echo、Up/Down 召回歷史（給沒有行編輯的 dumb shell 用；預設 raw 直通）")
     args = parser.parse_args()
 
-    global enable_history, log_fp, default_line_ending, cooked_mode
+    global enable_history, enable_tcp_history, log_fp, default_line_ending, cooked_mode
     enable_history = not args.no_history
+    enable_tcp_history = not args.no_tcp_history
     default_line_ending = args.line_ending
     cooked_mode = args.cooked
     if args.log_file:
@@ -1126,6 +1142,7 @@ def main():
     _emit(f"  User   : telnet/raw {args.tcphost}:{args.tcp}")
     _emit("  兩方可同時連線，操作互相廣播，Device 回應廣播給所有人")
     _emit(f"  歷史紀錄: {'停用 (--no-history，即時廣播不受影響)' if args.no_history else '啟用'}")
+    _emit(f"  TCP 補歷史: {'關閉 (--no-tcp-history，新連線不灌舊紀錄；AI 照樣可查)' if args.no_tcp_history else '啟用'}")
     _emit(f"  換行    : {args.line_ending} {LINE_ENDINGS[args.line_ending]!r}")
     _emit(f"  行編輯  : {'cooked（本地 echo + Up/Down 歷史）' if args.cooked else 'raw（直通）'}")
     _emit(f"  Log 檔  : {args.log_file or '(未啟用，用 --log-file 持久化)'}")

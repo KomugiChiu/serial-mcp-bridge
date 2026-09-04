@@ -174,3 +174,17 @@ def test_take_line_partial_timeout_consumes():
 def test_take_line_empty_timeout():
     bridge._pending_clear()
     assert bridge._rx_take_line(0.01) == (b"", False)
+
+
+def test_tcp_history_gate():
+    # 預設：有快照就補；--no-tcp-history 只關 TCP 補送，AI 照樣可查（history 本體不動）
+    bridge.enable_history = True
+    bridge.enable_tcp_history = True
+    assert bridge._should_send_tcp_history(["a"]) is True
+    assert bridge._should_send_tcp_history([]) is False
+    bridge.enable_tcp_history = False
+    assert bridge._should_send_tcp_history(["a"]) is False
+    bridge.enable_history = False
+    bridge.enable_tcp_history = True
+    assert bridge._should_send_tcp_history(["a"]) is False
+    bridge.enable_history = True  # 還原預設
