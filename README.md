@@ -40,7 +40,7 @@ python serial_mcp_bridge.py --port /dev/ttyUSB0 --baud 115200 --auto-connect
 - `--port / -p` serial port（也可不指定，之後由 AI 用 `serial_connect` 連）
 - `--baud / -b` baud rate（預設 115200）
 - `--tcp / -t` User TCP/telnet 埠（預設 7001）
-- `--tcphost` TCP 綁定 IP（預設 0.0.0.0）
+- `--tcphost` TCP 綁定 IP（預設 127.0.0.1 只聽本機；用 0.0.0.0 會暴露到 LAN，任何人可注入 serial 指令）
 - `--auto-connect` 啟動時自動連指定的 port
 - `--no-history` 停用歷史紀錄（不記 history、新 TCP 不補歷史；即時廣播不受影響）
 - `--log-file` 持久化 log 到檔案（append），例：`--log-file serial.log`
@@ -78,6 +78,8 @@ uv tool install .
 `SERIAL_MCP_BRIDGE_PATH` 指向 `serial_mcp_bridge.py`，這支 CLI wrapper 需要。
 
 重啟 opencode 後，即可用 `serial_*` tools；User 同時用 telnet/raw 連 `127.0.0.1:7001`。
+
+> 舊版 `serial_bridge.py` 已廢棄，僅留供對照，請一律使用 `serial_mcp_bridge.py`。
 
 ## AI 端使用（MCP tools）
 

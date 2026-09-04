@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 """
+DEPRECATED：舊版純 TCP bridge，已由 `serial_mcp_bridge.py` 取代。
+
+- 新版修正：統一 rx_buffer、history lock、echo 去重、serial_flush/status race、TCP 關閉等。
+- 此檔僅保留供臨時對照，請新部署一律使用 `serial_mcp_bridge.py`。
+- 預計下個版本刪除。
+
 Serial Broadcast Bridge - 讓 人 與 AI 同時控制同一個 COM port 並互看對方操作
 Usage:
   python serial_bridge.py --port COM3 --baud 115200
