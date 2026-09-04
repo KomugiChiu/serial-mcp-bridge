@@ -47,20 +47,82 @@ except ImportError:
 serial_conn: Optional[serial.Serial] = None
 serial_lock = threading.Lock()
 history = deque(maxlen=1000)          # 歷史紀錄，給新連線者看（可用 --no-history 停用）
+history_lock = threading.Lock()     # 保護 history 的併發存取
 enable_history = True               # 是否紀錄歷史，由啟動參數 --no-history 控制
+# 統一接收緩衝：只有 serial_reader 線程讀硬體，MCP 的 read/readline/write_read 都從這裡取
+rx_buffer: deque = deque()          # 每個元素是一段 bytes（Device 去 echo 後的資料）
+rx_lock = threading.Lock()
+rx_cond = threading.Condition(rx_lock)
 tcp_clients = []                      # User 的 TCP 連線清單
 tcp_clients_lock = threading.Lock()
 pending_echo = bytearray()            # 剛送出給設備的字元，供 echo 去重複
 echo_lock = threading.Lock()
+log_fp = None                       # --log-file 開啟的檔案 handle（持久化）
+log_fp_lock = threading.Lock()
 running = True
+
+
+def _emit(line: str):
+    """寫到 stderr，同時 tee 到 --log-file（若有）。"""
+    print(line, file=sys.stderr, flush=True)
+    if log_fp is not None:
+        with log_fp_lock:
+            try:
+                log_fp.write(line + "\n")
+                log_fp.flush()
+            except Exception:
+                pass
 
 
 def log(msg: str, to_history: bool = True):
     timestamp = datetime.now().strftime("%H:%M:%S")
     line = f"[{timestamp}] {msg}"
-    print(line, file=sys.stderr, flush=True)
+    _emit(line)
     if to_history and enable_history:
-        history.append(line)
+        with history_lock:
+            history.append(line)
+
+
+def _history_snapshot() -> list:
+    """線程安全地拷貝歷史紀錄。"""
+    with history_lock:
+        return list(history)
+
+
+def _rx_push(data: bytes):
+    """Device 資料推入統一接收緩衝（僅 serial_reader 路徑呼叫）。"""
+    if not data:
+        return
+    with rx_cond:
+        rx_buffer.append(bytes(data))
+        rx_cond.notify_all()
+
+
+def _rx_drain() -> bytes:
+    """取走目前緩衝全部資料（不清硬體 buffer，硬體由 reader 持續排空）。"""
+    with rx_cond:
+        if not rx_buffer:
+            return b""
+        chunks = list(rx_buffer)
+        rx_buffer.clear()
+        return b"".join(chunks)
+
+
+def _rx_wait(timeout_s: float, predicate=None) -> bytes:
+    """等到 predicate(buffer) 為真或超時；回傳當下全部緩衝（不清空，由呼叫方決定）。"""
+    deadline = time.monotonic() + timeout_s
+    with rx_cond:
+        while True:
+            blob = b"".join(rx_buffer)
+            if predicate is None:
+                if blob:
+                    return blob
+            elif predicate(blob):
+                return blob
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return b"".join(rx_buffer)
+            rx_cond.wait(timeout=remaining)
 
 
 # ============================================================
@@ -122,8 +184,9 @@ def broadcast_text(data: bytes, show_as: str):
     if not data:
         return
 
+    is_device = show_as.startswith("Device")
     # 設備 echo 去重複：設備回顯剛送出的指令時，扣除相符的字元，避免「ls」重複出現
-    if show_as.startswith("Device"):
+    if is_device:
         with echo_lock:
             consumed = 0
             for b in data:
@@ -137,6 +200,10 @@ def broadcast_text(data: bytes, show_as: str):
 
     if not data:
         return
+
+    if is_device:
+        # 統一接收路徑：Device 資料先進 rx_buffer，MCP read/readline/write_read 從這裡取
+        _rx_push(data)
 
     try:
         text = data.decode('utf-8', errors='replace').strip()
@@ -223,8 +290,9 @@ def tcp_bridge(listen_host: str, listen_port: int):
 def handle_tcp_client(conn, addr):
     log(f"[SYS] User 連線 {addr} (目前 {len(tcp_clients)+1} 個)")
     try:
-        if enable_history and history:
-            conn.sendall(("\n".join(history) + "\n").encode('utf-8', errors='replace'))
+        snapshot = _history_snapshot()
+        if enable_history and snapshot:
+            conn.sendall(("\n".join(snapshot) + "\n").encode('utf-8', errors='replace'))
         conn.sendall("--- 已連線，可輸入指令，AI/人的操作會互相廣播 ---\n".encode('utf-8'))
     except Exception:
         pass
@@ -234,7 +302,6 @@ def handle_tcp_client(conn, addr):
             data = conn.recv(4096)
             if not data:
                 break
-            text_preview = data.decode('utf-8', errors='replace').strip()
             tag = f"{addr} -> Device"
             with tcp_clients_lock:
                 for c in tcp_clients:
@@ -243,9 +310,7 @@ def handle_tcp_client(conn, addr):
                             c.sendall(f"[{tag}] ".encode() + data)
                         except Exception:
                             pass
-            if text_preview:
-                for line in text_preview.splitlines():
-                    log(f"[{tag}] {line}")
+            # 歷史只記一次：由 write_serial -> broadcast_text 記錄 [User(addr) -> Device]
             write_serial(data, source=f"User({addr})")
     except Exception as e:
         log(f"[SYS] User {addr} 錯誤: {e}")
@@ -265,6 +330,28 @@ server = Server("serial-bridge-mcp")
 
 def _text(msg: str) -> list[TextContent]:
     return [TextContent(type="text", text=msg)]
+
+
+def _encode_write_data(data_str: str, encoding: str, append_crlf: bool):
+    """把 write/write_read 的字串參數轉成 bytes；回傳 (data, err_msg)。"""
+    if encoding == "hex":
+        try:
+            return bytes.fromhex(data_str), ""
+        except ValueError:
+            return b"", "❌ Hex 格式錯誤"
+    try:
+        data = data_str.encode(encoding)
+    except (LookupError, ValueError):
+        return b"", f"❌ 不支援的編碼: {encoding}"
+    if append_crlf:
+        data += b"\r\n"
+    return data, ""
+
+
+def _is_serial_open() -> bool:
+    with serial_lock:
+        conn = serial_conn
+        return conn is not None and conn.is_open
 
 
 @server.list_tools()
@@ -290,12 +377,21 @@ async def list_tools() -> list[Tool]:
                               "append_crlf": {"type": "boolean", "description": "是否自動加 \\r\\n", "default": True},
                           },
                           "required": ["data"]}),
-        Tool(name="serial_read", description="從 Serial Port 讀取目前緩衝資料",
+        Tool(name="serial_read", description="從統一接收緩衝讀取 Device 回應（與 TCP 廣播/歷史同源，不會跟讀取線程搶 port）",
              inputSchema={"type": "object",
                           "properties": {"timeout_ms": {"type": "integer", "description": "讀取超時（毫秒）", "default": 200}}}),
-        Tool(name="serial_readline", description="從 Serial Port 讀取一行（直到換行）",
+        Tool(name="serial_readline", description="從統一接收緩衝讀取一行（直到換行）",
              inputSchema={"type": "object",
                           "properties": {"timeout_ms": {"type": "integer", "description": "讀取超時（毫秒）", "default": 1500}}}),
+        Tool(name="serial_write_read", description="送指令後等待回應（先清待讀緩衝再寫，適合問答式設備；會消耗緩衝）",
+             inputSchema={"type": "object",
+                          "properties": {
+                              "data": {"type": "string", "description": "要寫入的資料"},
+                              "encoding": {"type": "string", "description": "編碼", "default": "utf-8", "enum": ["utf-8", "ascii", "hex"]},
+                              "append_crlf": {"type": "boolean", "description": "是否自動加 \\r\\n", "default": True},
+                              "wait_ms": {"type": "integer", "description": "寫入後等待回應的時間（毫秒）", "default": 500},
+                          },
+                          "required": ["data"]}),
         Tool(name="serial_status", description="取得 Serial Port 連線狀態",
              inputSchema={"type": "object", "properties": {}}),
         Tool(name="serial_list_ports", description="列出所有可用 Serial Ports",
@@ -303,6 +399,14 @@ async def list_tools() -> list[Tool]:
         Tool(name="serial_get_history", description="取得最近的 Serial 輸出歷史（含 User / AI / Device 操作）",
              inputSchema={"type": "object",
                           "properties": {"lines": {"type": "integer", "description": "行數", "default": 50}}}),
+        Tool(name="serial_search_history", description="搜尋歷史紀錄（按關鍵字/來源過濾）",
+             inputSchema={"type": "object",
+                          "properties": {
+                              "keyword": {"type": "string", "description": "關鍵字（子字串比對，空字串=不過濾）", "default": ""},
+                              "source": {"type": "string", "description": "來源過濾：AI / User / Device / SYS / 全部", "default": "全部", "enum": ["全部", "AI", "User", "Device", "SYS"]},
+                              "lines": {"type": "integer", "description": "往回搜尋幾行", "default": 200},
+                              "limit": {"type": "integer", "description": "最多回傳幾行", "default": 50},
+                          }}),
         Tool(name="serial_flush", description="清除 Serial Port 緩衝區 (input/output/both)",
              inputSchema={"type": "object",
                           "properties": {"which": {"type": "string", "default": "both", "enum": ["input", "output", "both"]}}}),
@@ -328,60 +432,82 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     elif name == "serial_write":
         data_str = arguments.get("data", "")
         enc = arguments.get("encoding", "utf-8")
-        if enc == "hex":
-            try:
-                data = bytes.fromhex(data_str)
-            except ValueError:
-                return _text("❌ Hex 格式錯誤")
-        else:
-            data = data_str.encode(enc)
-            if arguments.get("append_crlf", True):
-                data += b"\r\n"
+        data, err = _encode_write_data(data_str, enc, arguments.get("append_crlf", True))
+        if err:
+            return _text(err)
         ok = write_serial(data, source="AI")
         return _text(f"✅ 已寫入: {data_str}" if ok else "❌ 寫入失敗（Serial 未連線）")
 
+    elif name == "serial_write_read":
+        data_str = arguments.get("data", "")
+        enc = arguments.get("encoding", "utf-8")
+        wait_ms = arguments.get("wait_ms", 500)
+        data, err = _encode_write_data(data_str, enc, arguments.get("append_crlf", True))
+        if err:
+            return _text(err)
+        if not _is_serial_open():
+            return _text("❌ Serial 未連線")
+        _rx_drain()  # 先清掉陳舊待讀，避免回傳上次殘留
+        ok = write_serial(data, source="AI")
+        if not ok:
+            return _text("❌ 寫入失敗（Serial 未連線）")
+        blob = _rx_wait(wait_ms / 1000.0)
+        _rx_drain()  # 取走本次回應（與 read 語義一致：消耗）
+        if blob:
+            return _text(f"📥 回應 ({len(blob)} bytes):\n{blob.decode('utf-8', errors='replace')}")
+        return _text("📭 寫入成功，但等待時間內沒有回應（超時）")
+
     elif name == "serial_read":
         timeout_ms = arguments.get("timeout_ms", 200)
-        with serial_lock:
-            conn = serial_conn
-        if not conn or not conn.is_open:
+        if not _is_serial_open():
             return _text("❌ Serial 未連線")
-        with serial_lock:
-            old = conn.timeout
-            conn.timeout = timeout_ms / 1000.0
-            data = conn.read(1)
-            if data:
-                extra = conn.in_waiting
-                if extra:
-                    data += conn.read(extra)
-            conn.timeout = old
+        _rx_wait(timeout_ms / 1000.0)
+        data = _rx_drain()
         if data:
             return _text(f"📥 收到 ({len(data)} bytes):\n{data.decode('utf-8', errors='replace')}")
         return _text("📭 沒有資料（超時）")
 
     elif name == "serial_readline":
         timeout_ms = arguments.get("timeout_ms", 1500)
-        with serial_lock:
-            conn = serial_conn
-        if not conn or not conn.is_open:
+        if not _is_serial_open():
             return _text("❌ Serial 未連線")
-        with serial_lock:
-            old = conn.timeout
-            conn.timeout = timeout_ms / 1000.0
-            line = conn.readline()
-            conn.timeout = old
-        if line:
+        _rx_wait(timeout_ms / 1000.0, predicate=lambda blob: b"\n" in blob)
+        with rx_cond:
+            if not rx_buffer:
+                return _text("📭 沒有完整一行（超時）")
+            blob = b"".join(rx_buffer)
+            rx_buffer.clear()
+        if b"\n" in blob:
+            line, rest = blob.split(b"\n", 1)
+            line += b"\n"
+            if rest:
+                with rx_cond:
+                    rx_buffer.appendleft(rest)
+                    rx_cond.notify_all()
             return _text(f"📥 收到一行: {line.decode('utf-8', errors='replace').strip()}")
+        if blob:
+            # 有資料但沒有換行：照舊回傳（避免卡死），行為與之前 readline 超時不同但更實用
+            return _text(f"📥 收到 (無換行, {len(blob)} bytes): {blob.decode('utf-8', errors='replace').strip()}")
         return _text("📭 沒有完整一行（超時）")
 
     elif name == "serial_status":
         with serial_lock:
             conn = serial_conn
+        with tcp_clients_lock:
+            n_tcp = len(tcp_clients)
+        with rx_cond:
+            n_rx_chunks = len(rx_buffer)
+            n_rx_bytes = sum(len(c) for c in rx_buffer)
+        hist_state = "停用 (--no-history)" if not enable_history else f"啟用 ({len(_history_snapshot())} 行暫存)"
         if conn and conn.is_open:
             return _text(f"✅ Serial 狀態:\n  Port: {conn.port}\n  Baud: {conn.baudrate}\n"
                          f"  Bytesize: {conn.bytesize} Parity: {conn.parity} Stopbits: {conn.stopbits}\n"
-                         f"  In Waiting: {conn.in_waiting}")
-        return _text("❌ Serial 未連接")
+                         f"  In Waiting (硬體): {conn.in_waiting}\n"
+                         f"  待讀緩衝: {n_rx_bytes} bytes / {n_rx_chunks} 段\n"
+                         f"  歷史紀錄: {hist_state}\n"
+                         f"  TCP User: {n_tcp} 個")
+        return _text(f"❌ Serial 未連接\n  待讀緩衝: {n_rx_bytes} bytes / {n_rx_chunks} 段\n"
+                     f"  歷史紀錄: {hist_state}\n  TCP User: {n_tcp} 個")
 
     elif name == "serial_list_ports":
         from serial.tools.list_ports import comports
@@ -394,17 +520,38 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         if not enable_history:
             return _text("📭 歷史紀錄功能已停用（啟動時加了 --no-history）")
         lines = arguments.get("lines", 50)
-        recent = list(history)[-lines:]
+        recent = _history_snapshot()[-lines:]
         if recent:
             return _text(f"📜 最近 {len(recent)} 行:\n" + "\n".join(recent))
         return _text("📭 沒有歷史紀錄")
 
+    elif name == "serial_search_history":
+        if not enable_history:
+            return _text("📭 歷史紀錄功能已停用（啟動時加了 --no-history）")
+        keyword = arguments.get("keyword", "") or ""
+        source = arguments.get("source", "全部")
+        lines = arguments.get("lines", 200)
+        limit = arguments.get("limit", 50)
+        pool = _history_snapshot()[-lines:]
+        out = []
+        for entry in pool:
+            if source != "全部" and f"[{source}" not in entry and f"({source}" not in entry and f"{source} ->" not in entry:
+                continue
+            if keyword and keyword not in entry:
+                continue
+            out.append(entry)
+        out = out[-limit:]
+        if out:
+            return _text(f"🔍 命中 {len(out)} 行 (keyword={keyword!r}, source={source}):\n" + "\n".join(out))
+        return _text(f"📭 沒有命中 (keyword={keyword!r}, source={source})")
+
     elif name == "serial_flush":
         which = arguments.get("which", "both")
+        _rx_drain()  # 先清統一接收緩衝的待讀
         with serial_lock:
             conn = serial_conn
         if not conn or not conn.is_open:
-            return _text("❌ Serial 未連線")
+            return _text("✅ 已清除待讀緩衝（Serial 未連線，硬體 buffer 無需清除）")
         if which in ("input", "both"):
             conn.reset_input_buffer()
         if which in ("output", "both"):
@@ -434,19 +581,26 @@ def main():
     parser.add_argument("--tcphost", default="0.0.0.0", help="TCP 綁定 IP（User 用）")
     parser.add_argument("--auto-connect", action="store_true", help="啟動時自動連 serial")
     parser.add_argument("--no-history", action="store_true", help="停用歷史紀錄：不記 history、新 TCP 連線不補歷史、serial_get_history 回報停用（即時廣播不受影響）")
+    parser.add_argument("--log-file", default=None, help="持久化 log 到檔案（append），例: serial.log；stderr 照常輸出")
     args = parser.parse_args()
 
-    global enable_history
+    global enable_history, log_fp
     enable_history = not args.no_history
+    if args.log_file:
+        try:
+            log_fp = open(args.log_file, "a", encoding="utf-8")
+        except Exception as e:
+            print(f"[ERR] 無法開啟 log 檔 {args.log_file}: {e}", file=sys.stderr)
+            log_fp = None
 
-    print("=" * 62, file=sys.stderr)
-    print(" Serial Broadcast Bridge MCP Server (stdio)", file=sys.stderr)
-    print(f"  Serial : {args.port or '(未指定，用 serial_connect)'} @ {args.baud}", file=sys.stderr)
-    print(f"  User   : telnet/raw {args.tcphost}:{args.tcp}", file=sys.stderr)
-    print("  兩方可同時連線，操作互相廣播，Device 回應廣播給所有人", file=sys.stderr)
-    print(f"  歷史紀錄: {'停用 (--no-history，即時廣播不受影響)' if args.no_history else '啟用'}", file=sys.stderr)
-    print("=" * 62, file=sys.stderr)
-    sys.stderr.flush()
+    _emit("=" * 62)
+    _emit(" Serial Broadcast Bridge MCP Server (stdio)")
+    _emit(f"  Serial : {args.port or '(未指定，用 serial_connect)'} @ {args.baud}")
+    _emit(f"  User   : telnet/raw {args.tcphost}:{args.tcp}")
+    _emit("  兩方可同時連線，操作互相廣播，Device 回應廣播給所有人")
+    _emit(f"  歷史紀錄: {'停用 (--no-history，即時廣播不受影響)' if args.no_history else '啟用'}")
+    _emit(f"  Log 檔  : {args.log_file or '(未啟用，用 --log-file 持久化)'}")
+    _emit("=" * 62)
 
     global running
     running = True
@@ -466,6 +620,12 @@ def main():
         running = False
         close_serial()
         log("[SYS] 已關閉")
+        if log_fp is not None:
+            try:
+                with log_fp_lock:
+                    log_fp.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
