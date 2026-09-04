@@ -16,7 +16,7 @@ Usage:
   opencode local MCP config spawns this program (stdio) and opens the TCP bridge for users in the background.
 
 Dependencies:
-  pip install "mcp<2" pyserial
+  pip install "mcp>=1.0,<2" pyserial
 """
 import argparse
 import os
@@ -40,7 +40,7 @@ try:
     from mcp.server.stdio import stdio_server
     from mcp.types import TextContent, Tool
 except ImportError:
-    print("[ERROR] mcp (1.x) required: pip install \"mcp<2\"")
+    print("[ERROR] mcp (1.x) required: pip install \"mcp>=1.0,<2\"")
     sys.exit(1)
 
 # ============================================================
@@ -70,7 +70,7 @@ log_dir = "logs"                    # Overridden by --log-dir; files from !start
 LOG_HOLD_MAX = 4096                 # Max bytes to hold a ! line (beyond this, give up holding and forward everything to the device)
 # Newline appended on send: some devices (e.g. Android shell, which maps CR to LF via ICRNL) treat CRLF
 # as two newlines = one extra empty command = doubled prompt. Use --line-ending to switch to lf.
-LINE_ENDINGS = {"crlf": b"\r\n", "lf": b"\n", "cr": b"\r", "none": b""}
+LINE_ENDINGS = {"crlf": b"\r\n", "lf": b"\n", "cr": b"\r"}
 default_line_ending = "lf"          # Overridden by --line-ending
 cooked_mode = False               # Raw passthrough by default; --cooked enables bridge-side line editing (local echo + Up/Down history)
 running = True
@@ -79,11 +79,12 @@ running = True
 def _emit(line: str):
     """Write to stderr and tee into --log-file (if any)."""
     print(line, file=sys.stderr, flush=True)
-    if log_fp is not None:
-        with log_fp_lock:
+    with log_fp_lock:
+        fp = log_fp
+        if fp is not None:
             try:
-                log_fp.write(line + "\n")
-                log_fp.flush()
+                fp.write(line + "\n")
+                fp.flush()
             except Exception:
                 pass
 
@@ -218,20 +219,21 @@ def _tcp_announce(text: str, skip=()):
     data = (text + "\n").encode("utf-8", errors="replace")
     skipset = set(skip) if skip else set()
     with tcp_clients_lock:
-        dead = []
-        for c in tcp_clients:
-            if c in skipset:
-                continue
-            try:
-                c.sendall(data)
-            except Exception:
-                dead.append(c)
-        for d in dead:
-            try:
-                tcp_clients.remove(d)
-            except ValueError:
-                pass
-            log("[SYS] TCP client disconnected (during broadcast)")
+        targets = [c for c in tcp_clients if c not in skipset]
+    dead = []
+    for c in targets:
+        try:
+            c.sendall(data)
+        except Exception:
+            dead.append(c)
+    if dead:
+        with tcp_clients_lock:
+            for d in dead:
+                try:
+                    tcp_clients.remove(d)
+                except ValueError:
+                    pass
+                log("[SYS] TCP client disconnected (during broadcast)")
 
 
 def _parse_log_command(line: str) -> tuple:
@@ -304,6 +306,8 @@ class TcpCommandFilter:
     Rules:
     - Hold a line only when ! arrives at a line start (fresh connection or right after a newline);
       everything else passes through with zero delay, so interactivity is unaffected.
+    - Multi-line packets are scanned line by line, so a pasted ! command starting a later
+      line in the same packet is still intercepted.
     - While holding, buffer printable chars with live echo; give up on backspace/ESC/control chars/overflow,
       forwarding the whole chunk to the device (it handles editing), so the bridge never swallows input.
     - Once the newline arrives, judge the whole line: bridge commands run locally, the rest is forwarded as-is.
@@ -328,63 +332,77 @@ class TcpCommandFilter:
 
         Echo contract: bytes the sender should see are returned here exactly once; the caller just
         conn.sendall(echo), and to_device never goes through pushback again.
+
+        Iterative (no recursion): a single packet full of short ! lines must not grow the call stack.
         """
         to_dev = bytearray()
         echo = bytearray()
         consumed = False
-        if not self.holding:
-            if self.at_line_start and data[:1] == b"!":
-                self.holding = True
-            else:
-                if _wants_pushback(data):
-                    echo += data
-                self._track_line(data)
-                return bytes(data), bytes(echo), False
-        i, n = 0, len(data)
-        while i < n:
-            b = data[i]
-            if b in (0x0A, 0x0D):
-                self.buf.append(b)
-                line = bytes(self.buf)
-                self.buf.clear()
-                self.holding = False
-                self.at_line_start = True
-                fwd = process_line(line)
-                if fwd == b"":
-                    consumed = True
+        pending = bytes(data)
+        while pending:
+            if not self.holding:
+                if self.at_line_start and pending[:1] == b"!":
+                    self.holding = True
                 else:
-                    to_dev += fwd  # Already echoed char-by-char while holding; no extra echo
-                i += 1
-                if i < n:
-                    d2, e2, c2 = self.feed(data[i:], process_line)
-                    to_dev += d2
-                    echo += e2
-                    consumed = consumed or c2
-                break
-            elif 0x20 <= b <= 0x7E or b >= 0x80:
-                if len(self.buf) >= LOG_HOLD_MAX:
-                    rest = bytes(self.buf) + data[i:]
+                    # Passthrough one line at a time, so a ! command starting a later
+                    # line in the same packet is still intercepted (pasted input).
+                    nl = len(pending)
+                    for k, byte in enumerate(pending):
+                        if byte in (0x0A, 0x0D):
+                            nl = k + 1
+                            break
+                    seg, pending = pending[:nl], pending[nl:]
+                    if _wants_pushback(seg):
+                        echo += seg
+                    to_dev += seg
+                    self._track_line(seg)
+                    continue
+            # Holding: scan byte-by-byte until newline / abandon / end of packet.
+            i, n = 0, len(pending)
+            while i < n:
+                b = pending[i]
+                if b in (0x0A, 0x0D):
+                    self.buf.append(b)
+                    line = bytes(self.buf)
+                    self.buf.clear()
+                    self.holding = False
+                    self.at_line_start = True
+                    fwd = process_line(line)
+                    if fwd == b"":
+                        consumed = True
+                    else:
+                        to_dev += fwd  # Already echoed char-by-char while holding; no extra echo
+                    pending = pending[i + 1:]
+                    break
+                elif 0x20 <= b <= 0x7E or b >= 0x80:
+                    if len(self.buf) >= LOG_HOLD_MAX:
+                        rest = bytes(self.buf) + pending[i:]
+                        to_dev += rest
+                        if _wants_pushback(rest):
+                            echo += rest
+                        self._track_line(rest)
+                        self.buf.clear()
+                        self.holding = False
+                        pending = b""
+                        break
+                    self.buf.append(b)
+                    echo += bytes((b,))
+                    i += 1
+                else:
+                    # Backspace/ESC/other control chars: give up holding, forward everything to the device
+                    rest = bytes(self.buf) + pending[i:]
                     to_dev += rest
-                    if _wants_pushback(rest):
-                        echo += rest
+                    tail = pending[i:]
+                    if _wants_pushback(tail):
+                        echo += tail
                     self._track_line(rest)
                     self.buf.clear()
                     self.holding = False
+                    pending = b""
                     break
-                self.buf.append(b)
-                echo += bytes((b,))
-                i += 1
             else:
-                # Backspace/ESC/other control chars: give up holding, forward everything to the device
-                rest = bytes(self.buf) + data[i:]
-                to_dev += rest
-                tail = data[i:]
-                if _wants_pushback(tail):
-                    echo += tail
-                self._track_line(rest)
-                self.buf.clear()
-                self.holding = False
-                break
+                # Whole packet buffered while holding; wait for the newline in a later packet.
+                pending = b""
         return bytes(to_dev), bytes(echo), consumed
 
 
@@ -423,31 +441,10 @@ def _rx_drain() -> bytes:
         return b"".join(chunks)
 
 
-def _rx_wait(timeout_s: float, predicate=None) -> bytes:
-    """Wait until predicate(buffer) holds or timeout; return the buffered data as-is (caller decides).
-
-    Note: `_rx_wait()` + `_rx_drain()` has a race (data arriving in between gets swept along).
-    New code should use the atomic `_rx_wait_and_drain()` / `_rx_take_line()`.
-    """
-    deadline = time.monotonic() + timeout_s
-    with rx_cond:
-        while True:
-            blob = b"".join(rx_buffer)
-            if predicate is None:
-                if blob:
-                    return blob
-            elif predicate(blob):
-                return blob
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return b"".join(rx_buffer)
-            rx_cond.wait(timeout=remaining)
-
-
 def _rx_wait_and_drain(timeout_s: float, predicate=None) -> bytes:
     """Wait until the predicate holds or timeout, then atomically take everything under the same lock.
 
-    Avoids the `_rx_wait()` + `_rx_drain()` two-step race: data arriving in between
+    Avoids the two-step wait-then-drain race: data arriving in between
     is not swept along; exactly the judged content is taken (on timeout, whatever is there,
     b"" if empty).
     """
@@ -575,10 +572,13 @@ def open_serial(port: str, baudrate: int, timeout: float = 0.1,
 
 def close_serial():
     global serial_conn
+    closed = False
     with serial_lock:
         if serial_conn and serial_conn.is_open:
             serial_conn.close()
-            log("[SYS] Serial closed")
+            closed = True
+    if closed:
+        log("[SYS] Serial closed")
     _pending_clear()
 
 
@@ -590,22 +590,30 @@ def write_serial(data: bytes, source: str = "AI", to_tcp: bool = True, skip_conn
     Input is kept even when disconnected: recorded as (not sent) for monitoring/debugging.
     """
     with serial_lock:
-        if serial_conn and serial_conn.is_open:
+        conn = serial_conn
+        is_open = conn is not None and conn.is_open
+        if is_open:
             try:
-                serial_conn.write(data)
-                serial_conn.flush()
-                # Record just-sent bytes for device echo dedup
-                _pending_push(data)
-                broadcast_text(data, show_as=f"{source} -> Device", to_tcp=to_tcp,
-                               skip_conns=skip_conns)
-                return True
+                assert conn is not None
+                conn.write(data)
+                conn.flush()
+                wrote = True
             except Exception as e:
                 log(f"[ERR] Write error: {e}")
                 return False
         else:
-            broadcast_text(data, show_as=f"{source} -> Device (not sent)", to_tcp=False)
-            log("[WARN] Serial not connected, command not sent")
-            return False
+            wrote = False
+    if wrote:
+        # Echo expectation first (reader may already be delivering the echo),
+        # then history/TCP fan-out without holding serial_lock (blocking I/O).
+        _pending_push(data)
+        broadcast_text(data, show_as=f"{source} -> Device", to_tcp=to_tcp,
+                       skip_conns=skip_conns)
+        return True
+    else:
+        broadcast_text(data, show_as=f"{source} -> Device (not sent)", to_tcp=False)
+        log("[WARN] Serial not connected, command not sent")
+        return False
 
 
 # ============================================================
@@ -641,20 +649,24 @@ def broadcast_text(data: bytes, show_as: str, to_tcp: bool = True, skip_conns=()
     if not to_tcp:
         return
 
-    # Push to the users TCP clients
+    # Push to the users TCP clients (copy-then-send: never hold the lock across blocking I/O)
     skip = set(skip_conns) if skip_conns else set()
     with tcp_clients_lock:
-        dead = []
-        for conn in tcp_clients:
-            if conn in skip:
-                continue
-            try:
-                conn.sendall(data)
-            except Exception:
-                dead.append(conn)
-        for d in dead:
-            tcp_clients.remove(d)
-            log(f"[SYS] TCP client disconnected")
+        targets = [c for c in tcp_clients if c not in skip]
+    dead = []
+    for conn in targets:
+        try:
+            conn.sendall(data)
+        except Exception:
+            dead.append(conn)
+    if dead:
+        with tcp_clients_lock:
+            for d in dead:
+                try:
+                    tcp_clients.remove(d)
+                except ValueError:
+                    pass
+                log("[SYS] TCP client disconnected")
 
 
 def serial_reader():
@@ -807,19 +819,21 @@ def handle_tcp_client(conn, addr):
                 write_serial(data, source=f"User({addr})", to_tcp=False)
                 continue
             with tcp_clients_lock:
-                dead = []
-                for c in tcp_clients:
-                    if c != conn:
+                others = [c for c in tcp_clients if c != conn]
+            dead = []
+            for c in others:
+                try:
+                    c.sendall(b"[usr] " + data)
+                except Exception:
+                    dead.append(c)
+            if dead:
+                with tcp_clients_lock:
+                    for d in dead:
                         try:
-                            c.sendall(b"[usr] " + data)
-                        except Exception:
-                            dead.append(c)
-                for d in dead:
-                    try:
-                        tcp_clients.remove(d)
-                    except ValueError:
-                        pass
-                    log("[SYS] TCP client disconnected (during relay)")
+                            tcp_clients.remove(d)
+                        except ValueError:
+                            pass
+                        log("[SYS] TCP client disconnected (during relay)")
             # History is recorded exactly once, by write_serial -> broadcast_text as [usr].
             # Sender echo: cooked via editor-local echo; raw exactly once via TcpCommandFilter,
             # so to_tcp=False here always (others see live input via the [tag] relay above).
@@ -987,7 +1001,16 @@ class CookedLine:
         if self.cursor >= len(self.buf):
             self._bell(out)
             return
-        del self.buf[self.cursor:self.cursor + 1]
+        # Byte-oriented cursor may sit inside multibyte text: delete the whole
+        # codepoint starting at the cursor (mirrors _backspace; stray bytes delete one).
+        first = self.buf[self.cursor]
+        if 0xC2 <= first <= 0xF4:
+            cut = 1
+            while self.cursor + cut < len(self.buf) and self.buf[self.cursor + cut] & 0xC0 == 0x80:
+                cut += 1
+        else:
+            cut = 1
+        del self.buf[self.cursor:self.cursor + cut]
         self._redraw(out)
 
     def _del_word(self, out):

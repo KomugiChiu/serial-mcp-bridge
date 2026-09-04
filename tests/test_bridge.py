@@ -1,8 +1,11 @@
 """Pure-logic unit tests for serial_mcp_bridge (no hardware; stub out mcp/pyserial)."""
 import importlib.util
 import sys
+import threading
 import types
 from pathlib import Path
+
+import pytest
 
 
 def _load_bridge():
@@ -38,6 +41,18 @@ def _load_bridge():
 
 
 bridge = _load_bridge()
+
+
+@pytest.fixture(autouse=True)
+def _bridge_globals():
+    """Save/restore mutable bridge globals so one failing test cannot pollute the next."""
+    saved = (bridge.default_line_ending, bridge.cooked_mode, bridge.enable_history,
+             bridge.enable_tcp_history, bridge.log_dir)
+    yield
+    (bridge.default_line_ending, bridge.cooked_mode, bridge.enable_history,
+     bridge.enable_tcp_history, bridge.log_dir) = saved
+    bridge._pending_clear()
+    _reset_log_state()
 
 
 def test_encode_utf8_lf():
@@ -360,3 +375,76 @@ def test_clean_log_text():
     assert bridge._clean_log_text("console:/ $ ") == "console:/ $"
     assert bridge._clean_log_text("a  b   c") == "a  b   c"
     assert bridge._clean_log_text("^C `ls` ok") == "^C `ls` ok"  # ASCII kept as-is
+
+
+def test_cmd_filter_many_lines_no_recursion():
+    # A single packet full of short ! lines must not grow the call stack (used to recurse per line).
+    bridge.cooked_mode = False
+    f = bridge.TcpCommandFilter()
+    dev, echo, consumed = f.feed(b"!log_status\n" * 2000, lambda line: b"")
+    assert dev == b"" and consumed is True
+
+
+def test_cmd_filter_many_lines_mixed():
+    # Consumed commands and forwarded lines can interleave in one packet without recursion.
+    bridge.cooked_mode = False
+    f = bridge.TcpCommandFilter()
+    dev, echo, consumed = f.feed(
+        b"!log_status\nls\n!log_status\n", lambda line: b"" if line.startswith(b"!") else line)
+    assert dev == b"ls\n" and consumed is True
+
+
+def test_delete_at_multibyte():
+    # Delete-at-cursor removes the whole codepoint, mirroring _backspace.
+    bridge.default_line_ending = "lf"
+    ed = bridge.CookedLine()
+    ed.feed("中".encode())
+    ed._home(bytearray())
+    ed._delete_at(bytearray())
+    assert bytes(ed.buf) == b""
+    ed.buf = bytearray("a中b".encode())
+    ed.cursor = 1
+    ed._delete_at(bytearray())
+    assert bytes(ed.buf) == "ab".encode()
+
+
+def test_emit_concurrent_stop_safe(tmp_path):
+    # Stopping the log while another thread emits must not raise (write-to-closed is swallowed).
+    bridge.log_dir = str(tmp_path)
+    bridge._logfile_start("t.log", "TEST")
+    errors = []
+
+    def stopper():
+        try:
+            bridge._logfile_stop("TEST")
+        except Exception as e:  # pragma: no cover - must never happen
+            errors.append(e)
+
+    t = threading.Thread(target=stopper)
+    t.start()
+    for i in range(200):
+        bridge._emit(f"line {i}")
+    t.join()
+    assert not errors
+    bridge._emit("after stop")  # still works with no log file open
+
+
+class _BadConn:
+    def sendall(self, data):
+        raise OSError("broken pipe")
+
+
+def test_broadcast_dead_client_removed():
+    # Copy-then-send: a dead TCP client is dropped, the live one still gets the data.
+    bridge.enable_history = True
+    good = _FakeConn()
+    bridge.tcp_clients.append(good)
+    bridge.tcp_clients.append(_BadConn())
+    try:
+        bridge._pending_clear()
+        bridge.broadcast_text(b"hi\n", show_as="Device -> ALL", to_tcp=True)
+        assert b"hi\n" in bytes(good.sent)
+        assert all(isinstance(c, _FakeConn) for c in bridge.tcp_clients)
+    finally:
+        bridge.tcp_clients.clear()
+        bridge._rx_drain()

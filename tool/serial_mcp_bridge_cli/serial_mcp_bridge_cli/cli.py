@@ -13,14 +13,28 @@ import os
 import sys
 from pathlib import Path
 
-# Default script path used when SERIAL_MCP_BRIDGE_PATH is unset.
-# Adjust to the real install location, or override via the env var.
+# Fallback script path used when SERIAL_MCP_BRIDGE_PATH is unset and no
+# serial_mcp_bridge.py is found next to the CWD or this package.
 DEFAULT_BRIDGE_PATH = Path("~/Downloads/komugi/compart_bridge/serial_mcp_bridge.py").expanduser()
 
 
-def main() -> None:
+def _find_bridge() -> Path:
+    """Locate serial_mcp_bridge.py: env var first, then CWD, then parents of this file."""
     override = os.environ.get("SERIAL_MCP_BRIDGE_PATH")
-    bridge = Path(override) if override else DEFAULT_BRIDGE_PATH
+    if override:
+        return Path(override)
+    cwd_candidate = Path.cwd() / "serial_mcp_bridge.py"
+    if cwd_candidate.exists():
+        return cwd_candidate
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "serial_mcp_bridge.py"
+        if candidate.exists():
+            return candidate
+    return DEFAULT_BRIDGE_PATH
+
+
+def main() -> None:
+    bridge = _find_bridge()
 
     if not bridge.exists():
         print(

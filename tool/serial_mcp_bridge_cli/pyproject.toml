@@ -5,7 +5,7 @@ description = "Command wrapper to launch the Serial Broadcast Bridge MCP Server"
 requires-python = ">=3.10"
 dependencies = [
     "pyserial>=3.5",
-    "mcp<2",
+    "mcp>=1.0,<2",
 ]
 
 [project.scripts]
