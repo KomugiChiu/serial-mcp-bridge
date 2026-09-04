@@ -65,6 +65,7 @@ log_fp_lock = threading.Lock()
 # 會變成兩個換行 = 多執行一次空指令 = prompt 成雙。可用 --line-ending 改成 lf。
 LINE_ENDINGS = {"crlf": b"\r\n", "lf": b"\n", "cr": b"\r", "none": b""}
 default_line_ending = "lf"          # 由啟動參數 --line-ending 覆寫
+cooked_mode = True                # 預設啟用 bridge 端行編輯（本地 echo + Up/Down 歷史），由 --raw 關閉
 running = True
 
 
@@ -206,9 +207,12 @@ def close_serial():
             log("[SYS] Serial 已關閉")
 
 
-def write_serial(data: bytes, source: str = "AI", to_tcp: bool = True) -> bool:
-    """送資料給設備。to_tcp=False 時只記歷史、不即時推給 TCP（User 輸入用：
-    其他人已收到 [tag] 前綴轉發，sender 靠設備 echo 看到自己的輸入）。"""
+def write_serial(data: bytes, source: str = "AI", to_tcp: bool = True, skip_conns=()) -> bool:
+    """送資料給設備。to_tcp=False 不推給 TCP；skip_conns 跳過指定連線。
+
+    raw 模式的 User 輸入用 skip_others：sender 即時看到自己打的字，
+    其他人已有 [tag] 前綴轉發，不再收 raw（cooked 模式 sender 有本地 echo，沿用 to_tcp=False）。
+    """
     with serial_lock:
         if serial_conn and serial_conn.is_open:
             try:
@@ -216,7 +220,8 @@ def write_serial(data: bytes, source: str = "AI", to_tcp: bool = True) -> bool:
                 serial_conn.flush()
                 # 記錄「剛送出的字元」供設備 echo 去重複
                 _pending_push(data)
-                broadcast_text(data, show_as=f"{source} -> Device", to_tcp=to_tcp)
+                broadcast_text(data, show_as=f"{source} -> Device", to_tcp=to_tcp,
+                               skip_conns=skip_conns)
                 return True
             except Exception as e:
                 log(f"[ERR] 寫入錯誤: {e}")
@@ -229,7 +234,7 @@ def write_serial(data: bytes, source: str = "AI", to_tcp: bool = True) -> bool:
 # ============================================================
 # 廣播：Serial 讀取 -> TCP(user) + 歷史
 # ============================================================
-def broadcast_text(data: bytes, show_as: str, to_tcp: bool = True):
+def broadcast_text(data: bytes, show_as: str, to_tcp: bool = True, skip_conns=()):
     """把 bytes 廣播給 User 的 TCP clients，並記入歷史（供 MCP AI 用 serial_get_history 查）"""
     if not data:
         return
@@ -258,9 +263,12 @@ def broadcast_text(data: bytes, show_as: str, to_tcp: bool = True):
         return
 
     # 送給 User 的 TCP clients（近似原本 serial_bridge）
+    skip = set(skip_conns) if skip_conns else set()
     with tcp_clients_lock:
         dead = []
         for conn in tcp_clients:
+            if conn in skip:
+                continue
             try:
                 conn.sendall(data)
             except Exception:
@@ -338,9 +346,12 @@ def handle_tcp_client(conn, addr):
         if enable_history and snapshot:
             conn.sendall(("\n".join(snapshot) + "\n").encode('utf-8', errors='replace'))
         conn.sendall("--- 已連線，可輸入指令，AI/人的操作會互相廣播 ---\n".encode('utf-8'))
+        if cooked_mode:
+            conn.sendall("--- 行編輯已啟用：Up/Down 召回歷史 ---\n".encode('utf-8'))
     except Exception:
         pass
 
+    editor = CookedLine() if cooked_mode else None
     try:
         while running:
             data = conn.recv(4096)
@@ -349,6 +360,16 @@ def handle_tcp_client(conn, addr):
             data = _normalize_user_input(data)  # 按 --line-ending 正規化（lf 模式把 PuTTY 的 CRLF 轉 LF）
             if not data:
                 continue
+            if editor is not None:
+                conn_out, dev_out = editor.feed(data)
+                if conn_out:
+                    try:
+                        conn.sendall(conn_out)
+                    except Exception:
+                        break
+                data = dev_out
+                if not data:
+                    continue
             tag = f"{addr} -> Device"
             with tcp_clients_lock:
                 for c in tcp_clients:
@@ -357,9 +378,15 @@ def handle_tcp_client(conn, addr):
                             c.sendall(f"[{tag}] ".encode() + data)
                         except Exception:
                             pass
-            # 歷史只記一次：由 write_serial -> broadcast_text 記錄 [User(addr) -> Device]；
-            # raw 不再推給全部 TCP（其他人已收到上面的 [tag] 轉發，sender 靠設備 echo 看到輸入）
-            write_serial(data, source=f"User({addr})", to_tcp=False)
+            # 歷史只記一次：由 write_serial -> broadcast_text 記錄 [User(addr) -> Device]。
+            # cooked：sender 有本地 echo，不推 raw；raw：只推回給 sender（即時可見），
+            # 其他人已有上面的 [tag] 轉發，不再收 raw。
+            if editor is not None:
+                write_serial(data, source=f"User({addr})", to_tcp=False)
+            else:
+                with tcp_clients_lock:
+                    others = [c for c in tcp_clients if c != conn]
+                write_serial(data, source=f"User({addr})", to_tcp=True, skip_conns=others)
     except Exception as e:
         log(f"[SYS] User {addr} 錯誤: {e}")
     finally:
@@ -413,6 +440,309 @@ def _normalize_user_input(data: bytes) -> bytes:
     if default_line_ending == "cr":
         return data.replace(b"\r\n", b"\r").replace(b"\n", b"\r")
     return data
+
+
+def _is_serial_open() -> bool:
+    with serial_lock:
+        conn = serial_conn
+        return conn is not None and conn.is_open
+
+
+class CookedLine:
+    """單條 TCP 連線的行編輯器（--cooked 模式，給沒有行編輯能力的 dumb shell 用）。
+
+    bridge 接管本地 echo：可列印字元即時回顯，Enter 才整行送給設備；
+    Up/Down 召回此連線送過的指令。raw 模式（預設）走直通，不受影響。
+    Byte-oriented：退格遇到 UTF-8 multibyte 會整段刪；游標對齊按 byte 計。
+    """
+    HIST_MAX = 100
+    ESC_TIMEOUT_S = 0.5
+
+    def __init__(self):
+        self.buf = bytearray()
+        self.cursor = 0
+        self.hist = []        # 送過的完整行（不含換行）
+        self.hidx = 0         # 瀏覽位置（== len(hist) 表示正在打當前輸入）
+        self.saved = b""      # 瀏覽歷史時暫存的當前輸入
+        self.esc = b""        # 未收完的 ESC 序列（等下一包）
+        self.esc_ts = 0.0
+
+    # ---------- 顯示 ----------
+    def _redraw(self, out: bytearray):
+        # \r + 空白蓋掉舊行 + \r + 重印 + 游標歸位（只用 CR/空白/BS，不依賴 ANSI）
+        width = len(self.buf) + 32
+        if width < 64:
+            width = 64
+        out += b"\r" + b" " * width + b"\r" + bytes(self.buf)
+        back = len(self.buf) - self.cursor
+        if back > 0:
+            out += b"\x08" * back
+
+    def _bell(self, out: bytearray):
+        out += b"\x07"
+
+    # ---------- 歷史 ----------
+    def _hist_prev(self, out):
+        if not self.hist:
+            self._bell(out)
+            return
+        if self.hidx == len(self.hist):
+            self.saved = bytes(self.buf)
+        if self.hidx == 0:
+            self._bell(out)
+            return
+        self.hidx -= 1
+        self.buf = bytearray(self.hist[self.hidx])
+        self.cursor = len(self.buf)
+        self._redraw(out)
+
+    def _hist_next(self, out):
+        if self.hidx >= len(self.hist):
+            self._bell(out)
+            return
+        self.hidx += 1
+        if self.hidx == len(self.hist):
+            self.buf = bytearray(self.saved)
+        else:
+            self.buf = bytearray(self.hist[self.hidx])
+        self.cursor = len(self.buf)
+        self._redraw(out)
+
+    def _leave_browse(self):
+        if self.hidx != len(self.hist):
+            self.hidx = len(self.hist)
+
+    # ---------- 編輯 ----------
+    def _insert(self, out, ch: bytes):
+        self._leave_browse()
+        if self.cursor == len(self.buf):
+            self.buf += ch
+            self.cursor += len(ch)
+            out += ch
+        else:
+            self.buf[self.cursor:self.cursor] = ch
+            self.cursor += len(ch)
+            self._redraw(out)
+
+    def _backspace(self, out):
+        self._leave_browse()
+        if self.cursor == 0:
+            self._bell(out)
+            return
+        cut = 1
+        if self.cursor == len(self.buf):
+            while cut < self.cursor and self.buf[self.cursor - cut] & 0xC0 == 0x80:
+                cut += 1
+            if cut > 1 and not 0xC2 <= self.buf[self.cursor - cut] <= 0xF4:
+                cut = 1
+        del self.buf[self.cursor - cut:self.cursor]
+        self.cursor -= cut
+        if cut == 1 and self.cursor == len(self.buf):
+            out += b"\x08 \x08"
+        else:
+            self._redraw(out)
+
+    def _delete_at(self, out):
+        self._leave_browse()
+        if self.cursor >= len(self.buf):
+            self._bell(out)
+            return
+        del self.buf[self.cursor:self.cursor + 1]
+        self._redraw(out)
+
+    def _del_word(self, out):
+        self._leave_browse()
+        end = self.cursor
+        start = end
+        while start > 0 and self.buf[start - 1:start] == b" ":
+            start -= 1
+        while start > 0 and self.buf[start - 1:start] != b" ":
+            start -= 1
+        if start == end:
+            self._bell(out)
+            return
+        del self.buf[start:end]
+        self.cursor = start
+        self._redraw(out)
+
+    def _move(self, out, delta):
+        self._leave_browse()
+        pos = self.cursor + delta
+        if pos < 0:
+            pos = 0
+        if pos > len(self.buf):
+            pos = len(self.buf)
+        if pos == self.cursor:
+            self._bell(out)
+            return
+        self.cursor = pos
+        self._redraw(out)
+
+    def _home(self, out):
+        self._leave_browse()
+        if self.cursor == 0:
+            self._bell(out)
+            return
+        self.cursor = 0
+        self._redraw(out)
+
+    def _end(self, out):
+        self._leave_browse()
+        if self.cursor == len(self.buf):
+            self._bell(out)
+            return
+        self.cursor = len(self.buf)
+        self._redraw(out)
+
+    def _reset_line(self):
+        self.buf.clear()
+        self.cursor = 0
+        self.hidx = len(self.hist)
+        self.saved = b""
+
+    def _submit(self, out, dev):
+        line = bytes(self.buf)
+        out += b"\r\n"
+        if line.strip(b" \t"):
+            self.hist.append(line)
+            if len(self.hist) > self.HIST_MAX:
+                del self.hist[0]
+        self.hidx = len(self.hist)
+        self.saved = b""
+        self.buf.clear()
+        self.cursor = 0
+        dev += line + LINE_ENDINGS.get(default_line_ending, b"\n")
+
+    def _csi(self, out, dev, data: bytes, i: int, n: int, now: float):
+        """解析 data[i] == ESC 處的序列；回傳新 i（None 表示等下一包）。"""
+        if n - i >= 3 and data[i + 1] == 0x5B:
+            c = data[i + 2]
+            two = data[i + 2:i + 4]
+            if c == 0x41:
+                self._hist_prev(out)
+                return i + 3
+            if c == 0x42:
+                self._hist_next(out)
+                return i + 3
+            if c == 0x43:
+                self._move(out, 1)
+                return i + 3
+            if c == 0x44:
+                self._move(out, -1)
+                return i + 3
+            if c == 0x48:
+                self._home(out)
+                return i + 3
+            if c == 0x46:
+                self._end(out)
+                return i + 3
+            if two == b"3~":
+                self._delete_at(out)
+                return i + 4
+            if two == b"1~":
+                self._home(out)
+                return i + 4
+            if two == b"4~":
+                self._end(out)
+                return i + 4
+            # 未知 CSI：找終止字元（0x40-0x7E，找到就是完整序列，原樣透傳；
+            # 沒找到表示被截斷，等下一包）
+            j = i + 2
+            while j < n and 0x20 <= data[j] <= 0x3F:
+                j += 1
+            if j < n and 0x40 <= data[j] <= 0x7E:
+                dev += data[i:j + 1]
+                return j + 1
+            if j == i + 2:
+                # ESC[ 後面完全不是 CSI 字元：之前的 stash 是誤判，丟掉 ESC[ 從此處重來
+                return i + 2
+            self.esc = data[i:]
+            self.esc_ts = now
+            return None
+        if n - i == 1 or data[i + 1] == 0x5B:
+            self.esc = data[i:]  # 被截斷，等下一包
+            self.esc_ts = now
+            return None
+        return i + 1  # 裸 ESC（如 Alt 組合）：丟掉 ESC，主鍵下輪當一般字元
+
+    def feed(self, data: bytes):
+        """吃一包 TCP 輸入；回傳 (to_conn, to_device)。
+        to_conn 直接回給 sender（本地 echo/重繪），to_device 整包送設備。"""
+        now = time.monotonic()
+        if self.esc:
+            if now - self.esc_ts > self.ESC_TIMEOUT_S:
+                self.esc = b""  # 陳舊未完成序列丟掉
+            else:
+                data = self.esc + data
+                self.esc = b""
+        out = bytearray()
+        dev = bytearray()
+        i, n = 0, len(data)
+        while i < n:
+            b = data[i]
+            if b == 0x1B:
+                ni = self._csi(out, dev, data, i, n, now)
+                if ni is None:
+                    break
+                i = ni
+                continue
+            if b in (0x0D, 0x0A):  # Enter 變體：CR / LF / CRLF / CR NUL 都算一次
+                if b == 0x0D and i + 1 < n and data[i + 1] in (0x0A, 0x00):
+                    i += 1
+                self._submit(out, dev)
+                i += 1
+                continue
+            if b == 0x00:
+                i += 1  # NUL 丟掉
+                continue
+            if b == 0x03:  # Ctrl+C：中斷設備 + 清行
+                dev += b"\x03"
+                self._reset_line()
+                out += b"^C\r\n"
+                i += 1
+                continue
+            if b == 0x1A:  # Ctrl+Z：透傳 + 清行
+                dev += b"\x1a"
+                self._reset_line()
+                out += b"^Z\r\n"
+                i += 1
+                continue
+            if b == 0x15:  # Ctrl+U：整行刪
+                self._leave_browse()
+                self.buf.clear()
+                self.cursor = 0
+                self._redraw(out)
+                i += 1
+                continue
+            if b == 0x17:  # Ctrl+W：刪一個詞
+                self._del_word(out)
+                i += 1
+                continue
+            if b == 0x04:  # Ctrl+D：空行送 EOT，否則刪游標字元
+                if not self.buf:
+                    dev += b"\x04"
+                else:
+                    self._delete_at(out)
+                i += 1
+                continue
+            if b in (0x08, 0x7F):  # Backspace / DEL
+                self._backspace(out)
+                i += 1
+                continue
+            if b == 0x09:  # Tab：把當前行一起送出再補 Tab（device 要有內容才能補全）
+                self._leave_browse()
+                dev += bytes(self.buf) + b"\x09"
+                self.buf.clear()
+                self.cursor = 0
+                i += 1
+                continue
+            if b < 0x20:  # 其他控制字元：透傳
+                dev += bytes((b,))
+                i += 1
+                continue
+            self._insert(out, bytes((b,)))  # 可列印（含 multibyte 原樣）
+            i += 1
+        return bytes(out), bytes(dev)
 
 
 def _is_serial_open() -> bool:
@@ -570,15 +900,17 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             n_rx_chunks = len(rx_buffer)
             n_rx_bytes = sum(len(c) for c in rx_buffer)
         hist_state = "停用 (--no-history)" if not enable_history else f"啟用 ({len(_history_snapshot())} 行暫存)"
+        edit_state = "cooked" if cooked_mode else "raw"
         if conn and conn.is_open:
             return _text(f"✅ Serial 狀態:\n  Port: {conn.port}\n  Baud: {conn.baudrate}\n"
                          f"  Bytesize: {conn.bytesize} Parity: {conn.parity} Stopbits: {conn.stopbits}\n"
                          f"  In Waiting (硬體): {conn.in_waiting}\n"
                          f"  待讀緩衝: {n_rx_bytes} bytes / {n_rx_chunks} 段\n"
                          f"  歷史紀錄: {hist_state}\n"
+                         f"  行編輯: {edit_state}\n"
                          f"  TCP User: {n_tcp} 個")
         return _text(f"❌ Serial 未連接\n  待讀緩衝: {n_rx_bytes} bytes / {n_rx_chunks} 段\n"
-                     f"  歷史紀錄: {hist_state}\n  TCP User: {n_tcp} 個")
+                     f"  歷史紀錄: {hist_state}\n  行編輯: {edit_state}\n  TCP User: {n_tcp} 個")
 
     elif name == "serial_list_ports":
         from serial.tools.list_ports import comports
@@ -655,11 +987,16 @@ def main():
     parser.add_argument("--log-file", default=None, help="持久化 log 到檔案（append），例: serial.log；stderr 照常輸出")
     parser.add_argument("--line-ending", default="lf", choices=["crlf", "lf", "cr"],
                         help="送出的換行字元（預設 lf；少數需要 CRLF 的設備請用 crlf）")
+    parser.add_argument("--cooked", action="store_true",
+                        help="啟用 bridge 端行編輯（預設已啟用，保留此選項為相容）")
+    parser.add_argument("--raw", action="store_true",
+                        help="停用行編輯，改 raw 直通（給需要透傳二進制/依賴設備端補全的場景）")
     args = parser.parse_args()
 
-    global enable_history, log_fp, default_line_ending
+    global enable_history, log_fp, default_line_ending, cooked_mode
     enable_history = not args.no_history
     default_line_ending = args.line_ending
+    cooked_mode = not args.raw
     if args.log_file:
         try:
             log_fp = open(args.log_file, "a", encoding="utf-8")
@@ -674,6 +1011,7 @@ def main():
     _emit("  兩方可同時連線，操作互相廣播，Device 回應廣播給所有人")
     _emit(f"  歷史紀錄: {'停用 (--no-history，即時廣播不受影響)' if args.no_history else '啟用'}")
     _emit(f"  換行    : {args.line_ending} {LINE_ENDINGS[args.line_ending]!r}")
+    _emit(f"  行編輯  : {'cooked（本地 echo + Up/Down 歷史）' if args.cooked else 'raw（直通）'}")
     _emit(f"  Log 檔  : {args.log_file or '(未啟用，用 --log-file 持久化)'}")
     _emit("=" * 62)
 
