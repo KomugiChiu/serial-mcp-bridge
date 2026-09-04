@@ -65,7 +65,7 @@ log_fp_lock = threading.Lock()
 # 會變成兩個換行 = 多執行一次空指令 = prompt 成雙。可用 --line-ending 改成 lf。
 LINE_ENDINGS = {"crlf": b"\r\n", "lf": b"\n", "cr": b"\r", "none": b""}
 default_line_ending = "lf"          # 由啟動參數 --line-ending 覆寫
-cooked_mode = True                # 預設啟用 bridge 端行編輯（本地 echo + Up/Down 歷史），由 --raw 關閉
+cooked_mode = False               # 預設 raw 直通；--cooked 啟用 bridge 端行編輯（本地 echo + Up/Down 歷史）
 running = True
 
 
@@ -380,13 +380,15 @@ def handle_tcp_client(conn, addr):
                             pass
             # 歷史只記一次：由 write_serial -> broadcast_text 記錄 [User(addr) -> Device]。
             # cooked：sender 有本地 echo，不推 raw；raw：只推回給 sender（即時可見），
-            # 其他人已有上面的 [tag] 轉發，不再收 raw。
+            # 其他人已有上面的 [tag] 轉發，不再收 raw；含 ESC 的輸入不推（終端機會誤解讀）。
             if editor is not None:
                 write_serial(data, source=f"User({addr})", to_tcp=False)
-            else:
+            elif _wants_pushback(data):
                 with tcp_clients_lock:
                     others = [c for c in tcp_clients if c != conn]
                 write_serial(data, source=f"User({addr})", to_tcp=True, skip_conns=others)
+            else:
+                write_serial(data, source=f"User({addr})", to_tcp=False)
     except Exception as e:
         log(f"[SYS] User {addr} 錯誤: {e}")
     finally:
@@ -745,10 +747,14 @@ class CookedLine:
         return bytes(out), bytes(dev)
 
 
-def _is_serial_open() -> bool:
-    with serial_lock:
-        conn = serial_conn
-        return conn is not None and conn.is_open
+def _wants_pushback(data: bytes) -> bool:
+    """User 輸入是否要推回給 sender 即時顯示。
+
+    cooked 不推（本地 echo 已顯示）；raw 含 ESC 不推（方向鍵等序列推回去會被
+    終端機解讀成游標動作，反而把設備重繪打到錯的行；交給設備回顯/重繪顯示）。
+    其餘 raw 可列印輸入推回給 sender（打字即時可見）。
+    """
+    return not cooked_mode and b"\x1b" not in data
 
 
 @server.list_tools()
@@ -988,15 +994,13 @@ def main():
     parser.add_argument("--line-ending", default="lf", choices=["crlf", "lf", "cr"],
                         help="送出的換行字元（預設 lf；少數需要 CRLF 的設備請用 crlf）")
     parser.add_argument("--cooked", action="store_true",
-                        help="啟用 bridge 端行編輯（預設已啟用，保留此選項為相容）")
-    parser.add_argument("--raw", action="store_true",
-                        help="停用行編輯，改 raw 直通（給需要透傳二進制/依賴設備端補全的場景）")
+                        help="啟用 bridge 端行編輯：本地 echo、Up/Down 召回歷史（給沒有行編輯的 dumb shell 用；預設 raw 直通）")
     args = parser.parse_args()
 
     global enable_history, log_fp, default_line_ending, cooked_mode
     enable_history = not args.no_history
     default_line_ending = args.line_ending
-    cooked_mode = not args.raw
+    cooked_mode = args.cooked
     if args.log_file:
         try:
             log_fp = open(args.log_file, "a", encoding="utf-8")

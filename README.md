@@ -45,8 +45,7 @@ python serial_mcp_bridge.py --port /dev/ttyUSB0 --baud 115200 --auto-connect
 - `--no-history` 停用歷史紀錄（不記 history、新 TCP 不補歷史；即時廣播不受影響）
 - `--log-file` 持久化 log 到檔案（append），例：`--log-file serial.log`
 - `--line-ending {crlf,lf,cr}` 送出的換行字元（預設 `lf`；少數需要 CRLF 的設備請用 `crlf`；TCP user 輸入也會按此正規化）
-- `--cooked` 保留為相容（行編輯預設已啟用）
-- `--raw` 停用行編輯，改 raw 直通（透傳二進制、依賴設備端補全時用）
+- `--cooked` 啟用 bridge 端行編輯（本地 echo、Up/Down 召回歷史；給沒有行編輯的 dumb shell 用，預設 raw 直通）
 
 > 注意：MCP 走 **stdio**，因此輸出 log 一律寫到 stderr，請勿把 stdout 拿去印其他東西（會污染 MCP JSON-RPC 通道）。
 
