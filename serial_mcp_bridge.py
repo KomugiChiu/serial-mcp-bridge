@@ -378,8 +378,7 @@ class TcpCommandFilter:
                             nl = k + 1
                             break
                     seg, pending = pending[:nl], pending[nl:]
-                    if _wants_pushback(seg):
-                        echo += seg
+                    echo += _pushback_echo(seg)
                     to_dev += seg
                     self._track_line(seg)
                     continue
@@ -404,8 +403,7 @@ class TcpCommandFilter:
                     if len(self.buf) >= LOG_HOLD_MAX:
                         rest = bytes(self.buf) + pending[i:]
                         to_dev += rest
-                        if _wants_pushback(rest):
-                            echo += rest
+                        echo += _pushback_echo(rest)
                         self._track_line(rest)
                         self.buf.clear()
                         self.holding = False
@@ -419,8 +417,7 @@ class TcpCommandFilter:
                     rest = bytes(self.buf) + pending[i:]
                     to_dev += rest
                     tail = pending[i:]
-                    if _wants_pushback(tail):
-                        echo += tail
+                    echo += _pushback_echo(tail)
                     self._track_line(rest)
                     self.buf.clear()
                     self.holding = False
@@ -1234,14 +1231,44 @@ class CookedLine:
         return bytes(out), bytes(dev)
 
 
+def _echo_eligible(byte: int) -> bool:
+    """Whether one byte is safe for bridge pushback echo (pure function).
+
+    Printable / UTF-8 lead+continuation bytes and newlines are echoed so
+    typing stays visible (device echo is stripped by dedup). Tab and other
+    C0 controls are NOT echoed: the device owns them (Tab completion,
+    Ctrl-C handling, backspace erase sequences); echoing them back would
+    corrupt the display, e.g. Tab shown as a gap plus the completion
+    suffix ("ls te" + TAB + "st" instead of "ls test").
+    """
+    return byte in (0x0A, 0x0D) or 0x20 <= byte <= 0x7E or byte >= 0x80
+
+
+def _pushback_echo(data: bytes) -> bytes:
+    """Echo-eligible subset of raw input (pure function, easy to test).
+
+    Gate first (cooked never pushes; a packet containing ESC is an
+    arrow-key/cursor sequence, let the device redraw show it), then filter
+    per byte so a pasted Tab only suppresses itself, not the surrounding
+    printable text.
+    """
+    if cooked_mode or not data or b"\x1b" in data:
+        return b""
+    return bytes(b for b in data if _echo_eligible(b))
+
+
 def _wants_pushback(data: bytes) -> bool:
     """Whether user input should be pushed back to the sender for live display.
 
     Cooked never pushes (local echo already shows it); raw input with ESC never pushes (arrow-key
     sequences pushed back would be read as cursor moves, wrecking the device redraw; let the device echo/redraw show it).
+    Tab and other control chars (except newline) never push: the device owns completion/control
+    handling; echoing them corrupts the display (e.g. "ls te" + TAB gap + "st").
     Other printable raw input is pushed back to the sender (typing stays visible).
     """
-    return not cooked_mode and b"\x1b" not in data
+    if cooked_mode or not data or b"\x1b" in data:
+        return False
+    return all(_echo_eligible(b) for b in data)
 
 
 @server.list_tools()

@@ -149,9 +149,39 @@ def test_wants_pushback_esc():
     bridge.cooked_mode = False
     assert bridge._wants_pushback(b"ls") is True
     assert bridge._wants_pushback(b"\x1b[A") is False
+    assert bridge._wants_pushback(b"\x09") is False  # Tab: device owns completion
+    assert bridge._wants_pushback(b"\x03") is False  # Ctrl-C: device owns handling
+    assert bridge._wants_pushback(b"ls\n") is True  # newline still echoed
     bridge.cooked_mode = True
     assert bridge._wants_pushback(b"ls") is False
     bridge.cooked_mode = False  # restore default
+
+
+def test_pushback_echo_filters_tab():
+    # Tab completion regression: "ls te" + TAB must not echo the TAB back
+    # (else the terminal shows a gap plus the "st" suffix: "ls te    st").
+    bridge.cooked_mode = False
+    assert bridge._pushback_echo(b"\x09") == b""
+    assert bridge._pushback_echo(b"ls te") == b"ls te"
+    assert bridge._pushback_echo(b"ab\x09cd\n") == b"abcd\n"  # only TAB suppressed
+    assert bridge._pushback_echo(b"\x1b[A") == b""  # ESC sequences: nothing
+    bridge.cooked_mode = False
+
+
+def test_cmd_filter_tab_no_echo():
+    # End-to-end raw path: TAB is forwarded to the device but never echoed.
+    bridge.cooked_mode = False
+    f = bridge.TcpCommandFilter()
+    for ch in b"ls te":
+        dev, echo, consumed = f.feed(bytes((ch,)), lambda line: line)
+        assert (dev, echo) == (bytes((ch,)), bytes((ch,)))
+    dev, echo, consumed = f.feed(b"\x09", lambda line: line)
+    assert dev == b"\x09" and echo == b"" and consumed is False
+    # Pasted input with TAB: device gets everything, sender sees text minus TAB.
+    f2 = bridge.TcpCommandFilter()
+    dev, echo, consumed = f2.feed(b"ab\x09cd\n", lambda line: line)
+    assert dev == b"ab\x09cd\n" and echo == b"abcd\n"
+    bridge.cooked_mode = False
 
 
 def test_normalize_user_input_lf():
