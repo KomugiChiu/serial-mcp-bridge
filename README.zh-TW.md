@@ -55,7 +55,7 @@ python serial_mcp_bridge.py --port /dev/ttyUSB0 --baud 115200 --auto-connect
 參數：
 - `--port / -p` serial port（也可不指定，之後由 AI 用 `serial_connect` 連）
 - `--baud / -b` baud rate（預設 115200）
-- `--tcp / -t` User TCP/telnet 埠（預設 7001）
+- `--tcp / -t` User TCP/telnet 埠（預設 7001；`0` 停用 TCP bridge，只留 MCP）
 - `--tcphost` TCP 綁定 IP（預設 127.0.0.1 只聽本機；用 0.0.0.0 會暴露到 LAN，任何人可注入 serial 指令）
 - `--auto-connect` 啟動時自動連指定的 port
 - `--no-history` 停用歷史紀錄（不記 history、新 TCP 不補歷史；即時廣播不受影響）
@@ -64,6 +64,10 @@ python serial_mcp_bridge.py --port /dev/ttyUSB0 --baud 115200 --auto-connect
 - `--log-dir` `!start_log` / `serial_log_start` 開的檔放哪（自動建目錄，預設 `logs`；檔名只取 basename）
 - `--line-ending {crlf,lf,cr}` 送出的換行字元（預設 `lf`；少數需要 CRLF 的設備請用 `crlf`；TCP user 輸入也會按此正規化）
 - `--cooked` 啟用 bridge 端行編輯（本地 echo、Up/Down 召回歷史；給沒有行編輯的 dumb shell 用，預設 raw 直通）
+
+> 單例保護：第二個 bridge 若搶到相同的 TCP port 或 serial port 會立刻退出（`already running (pid=...)`），不會靜默跑 headless、讓 user 卡在舊的孤兒 process 上。死掉 process 留下的 lock 會自動接管。
+>
+> 生命週期：MCP 通道關閉或收到 SIGTERM/SIGINT 時 bridge 即退出。若孤兒 process 堆積（spawner 沒回收），用 `ps aux | grep serial-mcp-bridge` 查看、`pkill -f serial-mcp-bridge` 清掉。
 
 > 注意：MCP 走 **stdio**，因此輸出 log 一律寫到 stderr，請勿把 stdout 拿去印其他東西（會污染 MCP JSON-RPC 通道）。
 
