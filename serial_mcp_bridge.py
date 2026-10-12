@@ -159,6 +159,32 @@ LOG_HELP = ("bridge commands (handled by the bridge, never sent to the device):\
             "  !!prefix           escape hatch, forwarded to the device literally (e.g. !!ls sends !ls)")
 
 
+def _to_tcp_lineending(data: bytes) -> bytes:
+    """Convert bare LF to CRLF for telnet display (pure function, easy to test).
+
+    Telnet NVT (RFC 854) uses CRLF; PuTTY/MobaXterm show bare LF as
+    "down one line, same column" (staircase). Convert only bare LF:
+    existing CRLF stays CRLF, lone CR (device cursor-control / cooked
+    redraw using \\r without \\n) is preserved untouched.
+    """
+    if not data or b"\n" not in data:
+        return data
+    return data.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+
+
+def _tcp_send(conn, data: bytes):
+    """Send bytes to one TCP (telnet) client with CRLF normalization."""
+    try:
+        conn.sendall(_to_tcp_lineending(data))
+    except Exception:
+        raise
+
+
+def _tcp_send_text(conn, text: str):
+    """Send str to one TCP (telnet) client with CRLF normalization."""
+    _tcp_send(conn, (text.rstrip("\n") + "\n").encode("utf-8", errors="replace"))
+
+
 def _sanitize_log_name(name: str) -> str:
     """Whitelist filename filter: basename only, illegal chars become _ (pure function, easy to test)."""
     base = os.path.basename(name.strip())
@@ -216,7 +242,7 @@ def _logfile_status() -> str:
 
 def _tcp_announce(text: str, skip=()):
     """System broadcast to all TCP users (so the other side knows when recording starts/stops)."""
-    data = (text + "\n").encode("utf-8", errors="replace")
+    data = _to_tcp_lineending((text + "\n").encode("utf-8", errors="replace"))
     skipset = set(skip) if skip else set()
     with tcp_clients_lock:
         targets = [c for c in tcp_clients if c not in skipset]
@@ -265,7 +291,7 @@ def _make_command_processor(conn, addr):
 
     def reply(text: str):
         try:
-            conn.sendall((text.rstrip("\n") + "\n").encode("utf-8", errors="replace"))
+            conn.sendall(_to_tcp_lineending((text.rstrip("\n") + "\n").encode("utf-8", errors="replace")))
         except Exception:
             pass
 
@@ -656,7 +682,7 @@ def broadcast_text(data: bytes, show_as: str, to_tcp: bool = True, skip_conns=()
     dead = []
     for conn in targets:
         try:
-            conn.sendall(data)
+            conn.sendall(_to_tcp_lineending(data))
         except Exception:
             dead.append(conn)
     if dead:
@@ -770,11 +796,11 @@ def handle_tcp_client(conn, addr):
     try:
         snapshot = _history_snapshot()
         if _should_send_tcp_history(snapshot):
-            conn.sendall(("\n".join(snapshot) + "\n").encode('utf-8', errors='replace'))
-        conn.sendall("--- Connected. Type commands; AI/human actions are broadcast to each other ---\n".encode('utf-8'))
-        conn.sendall("--- bridge commands: !start_log [name] / !stop_log / !log_status / !help (!! escapes) ---\n".encode('utf-8'))
+            conn.sendall(_to_tcp_lineending(("\n".join(snapshot) + "\n").encode('utf-8', errors='replace')))
+        conn.sendall(_to_tcp_lineending("--- Connected. Type commands; AI/human actions are broadcast to each other ---\n".encode('utf-8')))
+        conn.sendall(_to_tcp_lineending("--- bridge commands: !start_log [name] / !stop_log / !log_status / !help (!! escapes) ---\n".encode('utf-8')))
         if cooked_mode:
-            conn.sendall("--- Line editing on: Up/Down recalls history ---\n".encode('utf-8'))
+            conn.sendall(_to_tcp_lineending("--- Line editing on: Up/Down recalls history ---\n".encode('utf-8')))
     except Exception:
         pass
 
@@ -794,7 +820,7 @@ def handle_tcp_client(conn, addr):
                 conn_out, dev_out = editor.feed(data)
                 if conn_out:
                     try:
-                        conn.sendall(conn_out)
+                        conn.sendall(_to_tcp_lineending(conn_out))
                     except Exception:
                         break
                 data = dev_out
@@ -809,7 +835,7 @@ def handle_tcp_client(conn, addr):
                 data, echo, consumed = cmdfilter.feed(data, process_cmd)
                 if echo:
                     try:
-                        conn.sendall(echo)
+                        conn.sendall(_to_tcp_lineending(echo))
                     except Exception:
                         break
                 if not data:
@@ -823,7 +849,7 @@ def handle_tcp_client(conn, addr):
             dead = []
             for c in others:
                 try:
-                    c.sendall(b"[usr] " + data)
+                    c.sendall(_to_tcp_lineending(b"[usr] " + data))
                 except Exception:
                     dead.append(c)
             if dead:

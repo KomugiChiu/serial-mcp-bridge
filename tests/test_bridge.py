@@ -443,8 +443,51 @@ def test_broadcast_dead_client_removed():
     try:
         bridge._pending_clear()
         bridge.broadcast_text(b"hi\n", show_as="Device -> ALL", to_tcp=True)
-        assert b"hi\n" in bytes(good.sent)
+        assert b"hi\r\n" in bytes(good.sent)  # telnet needs CRLF (was bare LF before fix)
         assert all(isinstance(c, _FakeConn) for c in bridge.tcp_clients)
     finally:
         bridge.tcp_clients.clear()
         bridge._rx_drain()
+
+
+def test_to_tcp_lineending():
+    # Bare LF -> CRLF for telnet; existing CRLF untouched; lone CR preserved
+    assert bridge._to_tcp_lineending(b"a\nb\n") == b"a\r\nb\r\n"
+    assert bridge._to_tcp_lineending(b"a\r\nb\r\n") == b"a\r\nb\r\n"
+    assert bridge._to_tcp_lineending(b"a\rb") == b"a\rb"  # lone CR: cursor-control / cooked redraw
+    assert bridge._to_tcp_lineending(b"\r" + b" " * 4 + b"\r" + b"ls") == b"\r" + b" " * 4 + b"\r" + b"ls"
+    assert bridge._to_tcp_lineending(b"mixed\r\nlf\ncr\rmix") == b"mixed\r\nlf\r\ncr\rmix"
+    assert bridge._to_tcp_lineending(b"") == b""
+    assert bridge._to_tcp_lineending(b"no newline") == b"no newline"
+
+
+def test_broadcast_to_tcp_uses_crlf():
+    # AI write (LF-only) and LF-only device output must reach TCP as CRLF
+    bridge.enable_history = True
+    good = _FakeConn()
+    bridge.tcp_clients.append(good)
+    try:
+        bridge._pending_clear()
+        bridge.broadcast_text(b"ls\n", show_as="AI -> Device", to_tcp=True)
+        assert bytes(good.sent).endswith(b"ls\r\n")
+        good.sent.clear()
+        bridge._pending_clear()
+        bridge.broadcast_text(b"out\nline2\n", show_as="Device -> ALL", to_tcp=True)
+        assert b"out\r\nline2\r\n" in bytes(good.sent)
+        # Existing CRLF device output is not doubled
+        good.sent.clear()
+        bridge._pending_clear()
+        bridge.broadcast_text(b"ok\r\n", show_as="Device -> ALL", to_tcp=True)
+        assert b"ok\r\n" in bytes(good.sent) and b"\r\r\n" not in bytes(good.sent)
+    finally:
+        bridge.tcp_clients.clear()
+        bridge._rx_drain()
+
+
+def test_tcp_send_text_crlf():
+    conn = _FakeConn()
+    bridge._tcp_send_text(conn, "hello\nworld\n")
+    assert bytes(conn.sent) == b"hello\r\nworld\r\n"
+    conn2 = _FakeConn()
+    bridge._tcp_send(conn2, b"a\n")
+    assert bytes(conn2.sent) == b"a\r\n"
