@@ -1,5 +1,7 @@
 """Pure-logic unit tests for serial_mcp_bridge (no hardware; stub out mcp/pyserial)."""
 import importlib.util
+import multiprocessing
+import os
 import sys
 import threading
 import types
@@ -521,3 +523,172 @@ def test_tcp_send_text_crlf():
     conn2 = _FakeConn()
     bridge._tcp_send(conn2, b"a\n")
     assert bytes(conn2.sent) == b"a\r\n"
+
+
+# ---------- single-instance guard ----------
+
+def _require_flock():
+    if not bridge._HAS_FCNTL:
+        pytest.skip("flock not available on this platform")
+
+
+def test_lock_names_sanitized(tmp_path):
+    assert bridge._lock_path("tcp-127.0.0.1-7001", str(tmp_path)).endswith(
+        "serial-mcp-bridge-tcp-127.0.0.1-7001.lock")
+    assert bridge._lock_path("serial-/dev/ttyUSB0", str(tmp_path)).endswith(
+        "serial-mcp-bridge-serial-_dev_ttyUSB0.lock")
+    assert bridge._tcp_lock_name("127.0.0.1", 7001) == "tcp-127.0.0.1-7001"
+    assert bridge._serial_lock_name("/dev/ttyUSB0") == "serial-/dev/ttyUSB0"
+
+
+def test_lock_acquire_release(tmp_path):
+    _require_flock()
+    name = "ut-basic"
+    try:
+        ok, _ = bridge._acquire_lock(name, str(tmp_path))
+        assert ok is True
+        ok2, _ = bridge._acquire_lock(name, str(tmp_path))  # same process: re-entrant
+        assert ok2 is True
+        assert (tmp_path / f"serial-mcp-bridge-{name}.lock").read_text().strip() == str(os.getpid())
+    finally:
+        bridge._release_lock(name)
+    assert name not in bridge._instance_locks
+    ok3, _ = bridge._acquire_lock(name, str(tmp_path))  # re-acquirable after release
+    assert ok3 is True
+    bridge._release_lock(name)
+
+
+def test_lock_owner_alive_basics():
+    assert bridge._lock_owner_alive(os.getpid()) is False
+    assert bridge._lock_owner_alive(0) is False
+    assert bridge._lock_owner_alive(-5) is False
+    assert bridge._lock_owner_alive(2 ** 30) is False  # dead pid
+    assert bridge._read_lock_pid("/nonexistent-path-xyz") == -1
+
+
+def test_lock_conflict_live_holder(tmp_path, monkeypatch):
+    # Another live bridge holds the lock: refuse loudly with its pid.
+    _require_flock()
+    import fcntl as _fcntl
+    name = "ut-conflict"
+    path = bridge._lock_path(name, str(tmp_path))
+    holder = open(path, "w")
+    holder.write("123456")
+    holder.flush()
+    _fcntl.flock(holder.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+    monkeypatch.setattr(bridge, "_lock_owner_alive", lambda pid: pid == 123456)
+    try:
+        ok, msg = bridge._acquire_lock(name, str(tmp_path))
+        assert ok is False and "123456" in msg and "already running" in msg
+        assert name not in bridge._instance_locks
+    finally:
+        monkeypatch.undo()
+        try:
+            _fcntl.flock(holder.fileno(), _fcntl.LOCK_UN)
+        except Exception:
+            pass
+        holder.close()
+
+
+def test_lock_stale_takeover(tmp_path):
+    # Dead pid in the lock file: take over and overwrite with our pid.
+    _require_flock()
+    name = "ut-stale"
+    path = bridge._lock_path(name, str(tmp_path))
+    path = Path(path)
+    path.write_text("1073741824")  # 2**30: no such process
+    try:
+        ok, _ = bridge._acquire_lock(name, str(tmp_path))
+        assert ok is True
+        assert path.read_text().strip() == str(os.getpid())
+    finally:
+        bridge._release_lock(name)
+
+
+def _child_hold_lock(lock_dir, name, ready):
+    import time as _time
+    ok, _ = bridge._acquire_lock(name, lock_dir)
+    ready.value = 1 if ok else -1
+    _time.sleep(10)
+
+
+def test_lock_cross_process_conflict(tmp_path):
+    # A real second process holding the lock blocks us; after it dies we take over.
+    _require_flock()
+    from multiprocessing import Value
+    name = "ut-xproc"
+    ready = Value("i", 0)
+    child = multiprocessing.Process(target=_child_hold_lock,
+                                    args=(str(tmp_path), name, ready))
+    try:
+        child.start()
+        for _ in range(100):
+            if ready.value != 0:
+                break
+            child.join(timeout=0.1)
+        assert ready.value == 1, "child failed to acquire the lock"
+        ok, _ = bridge._acquire_lock(name, str(tmp_path))
+        assert ok is False  # blocked by the live child
+    finally:
+        child.terminate()
+        child.join(timeout=5)
+    ok, _ = bridge._acquire_lock(name, str(tmp_path))  # stale pid file: take over
+    assert ok is True
+    bridge._release_lock(name)
+
+
+def test_open_serial_refused_by_other_bridge(tmp_path, monkeypatch):
+    # Second bridge on the same tty must refuse before touching pyserial.
+    _require_flock()
+    import fcntl as _fcntl
+    port = "/dev/ttyUT9"
+    monkeypatch.setenv("SERIAL_MCP_BRIDGE_LOCK_DIR", str(tmp_path))
+    holder = open(bridge._lock_path(bridge._serial_lock_name(port), str(tmp_path)), "w")
+    holder.write("123456")
+    holder.flush()
+    _fcntl.flock(holder.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+    monkeypatch.setattr(bridge, "_lock_owner_alive", lambda pid: pid == 123456)
+    calls = []
+    real_serial = bridge.serial
+
+    class _NoOpen:
+        def __init__(self, *a, **k):
+            calls.append((a, k))
+            raise AssertionError("pyserial must not be touched on lock refusal")
+
+    monkeypatch.setattr(bridge, "serial", types.SimpleNamespace(Serial=_NoOpen))
+    old_err = bridge._last_open_error
+    try:
+        assert bridge.open_serial(port, 115200) is False
+        assert calls == []
+        assert "already running" in bridge._last_open_error
+    finally:
+        monkeypatch.setattr(bridge, "serial", real_serial)
+        bridge._last_open_error = old_err
+        monkeypatch.undo()
+        try:
+            _fcntl.flock(holder.fileno(), _fcntl.LOCK_UN)
+        except Exception:
+            pass
+        holder.close()
+
+
+def test_bind_socket_conflict():
+    srv = bridge._bind_tcp_socket("127.0.0.1", 0)
+    try:
+        port = srv.getsockname()[1]
+        with pytest.raises(OSError):
+            bridge._bind_tcp_socket("127.0.0.1", port)
+    finally:
+        srv.close()
+
+
+def test_sigterm_handler_stops():
+    old_running = bridge.running
+    bridge.running = True
+    try:
+        with pytest.raises(SystemExit):
+            bridge._handle_sigterm(bridge.signal.SIGTERM, None)
+        assert bridge.running is False
+    finally:
+        bridge.running = old_running

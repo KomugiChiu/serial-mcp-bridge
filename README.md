@@ -53,7 +53,7 @@ python serial_mcp_bridge.py --port /dev/ttyUSB0 --baud 115200 --auto-connect
 Options:
 - `--port / -p` serial port (optional; the AI can connect later with `serial_connect`)
 - `--baud / -b` baud rate (default 115200)
-- `--tcp / -t` user TCP/telnet port (default 7001)
+- `--tcp / -t` user TCP/telnet port (default 7001; `0` disables the TCP bridge, MCP only)
 - `--tcphost` TCP bind IP (default 127.0.0.1, localhost only; `0.0.0.0` exposes it to the LAN where anyone could inject serial commands)
 - `--auto-connect` connect the given serial port on startup
 - `--no-history` disable history: no history recording, no history replay for new TCP clients; live broadcast unaffected
@@ -62,6 +62,10 @@ Options:
 - `--log-dir` directory for files started via `!start_log` / `serial_log_start` (auto-created, default `logs`; names are basenamed)
 - `--line-ending {crlf,lf,cr}` line ending appended on send (default `lf`; use `crlf` for devices that need CRLF; TCP user input is normalized the same way)
 - `--cooked` bridge-side line editing (local echo, Up/Down history recall; for dumb shells with no line editing; default is raw passthrough)
+
+> Single-instance: a second bridge on the same TCP endpoint or serial port exits immediately (`already running (pid=...)`) instead of running headless while the user stays connected to an orphaned previous instance. Stale locks from dead processes are taken over automatically.
+>
+> Lifecycle: the bridge exits when its MCP channel closes, or on SIGTERM/SIGINT. If orphaned processes pile up (the spawner never reaps them), list them with `ps aux | grep serial-mcp-bridge` and stop them with `pkill -f serial-mcp-bridge`.
 
 > Note: MCP runs over **stdio**, so all logs go to stderr. Never print anything else to stdout (it would corrupt the MCP JSON-RPC channel).
 

@@ -20,7 +20,9 @@ Dependencies:
 """
 import argparse
 import os
+import signal
 import socket
+import tempfile
 import threading
 import time
 import sys
@@ -28,6 +30,13 @@ import unicodedata
 from collections import deque
 from datetime import datetime
 from typing import Optional
+
+try:
+    import fcntl
+    _HAS_FCNTL = True
+except ImportError:
+    fcntl = None  # type: ignore
+    _HAS_FCNTL = False  # non-POSIX: single-instance guard is skipped
 
 try:
     import serial
@@ -74,6 +83,9 @@ LINE_ENDINGS = {"crlf": b"\r\n", "lf": b"\n", "cr": b"\r"}
 default_line_ending = "lf"          # Overridden by --line-ending
 cooked_mode = False               # Raw passthrough by default; --cooked enables bridge-side line editing (local echo + Up/Down history)
 running = True
+_instance_locks: dict = {}        # single-instance guard: lock name -> open file holding the flock
+_serial_lock_port: Optional[str] = None  # serial port this process currently holds the instance lock for
+_last_open_error: str = ""        # detail of the last open_serial() failure (surfaced to MCP callers)
 
 
 def _emit(line: str):
@@ -238,6 +250,133 @@ def _logfile_status() -> str:
         if log_fp is None:
             return "Not recording"
         return f"Recording: {log_name} ({log_owner})"
+
+
+# ============================================================
+# Single-instance guard (one bridge per TCP endpoint / serial port)
+# ============================================================
+def _default_lock_dir() -> str:
+    d = os.environ.get("XDG_RUNTIME_DIR") or os.environ.get("TMPDIR") or tempfile.gettempdir()
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        d = tempfile.gettempdir()
+    return d
+
+
+def _sanitize_lock_name(name: str) -> str:
+    clean = "".join(c if (c.isascii() and (c.isalnum() or c in "._-")) else "_" for c in name.strip())
+    return clean or "default"
+
+
+def _lock_path(name: str, lock_dir=None) -> str:
+    base = lock_dir or os.environ.get("SERIAL_MCP_BRIDGE_LOCK_DIR") or _default_lock_dir()
+    return os.path.join(base, f"serial-mcp-bridge-{_sanitize_lock_name(name)}.lock")
+
+
+def _tcp_lock_name(host: str, port: int) -> str:
+    return f"tcp-{host}-{port}"
+
+
+def _serial_lock_name(port: str) -> str:
+    return f"serial-{port}"
+
+
+def _read_lock_pid(path: str) -> int:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return int(f.read().strip().split()[0])
+    except Exception:
+        return -1
+
+
+def _lock_owner_alive(pid: int) -> bool:
+    """Whether pid is a live bridge process (guards against pid reuse).
+
+    A lock file with a dead pid is stale and may be taken over; a live pid
+    belonging to an unrelated process (pid recycled) is also treated as
+    stale. Only a live serial-mcp-bridge process blocks a new instance.
+    """
+    if pid <= 0 or pid == os.getpid():
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, just not ours
+    except Exception:
+        return True  # err on the safe side: refuse
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmd = f.read().decode("utf-8", errors="replace")
+        return ("serial-mcp-bridge" in cmd) or ("serial_mcp_bridge" in cmd)
+    except Exception:
+        return True  # non-Linux or unreadable: assume alive
+
+
+def _acquire_lock(name: str, lock_dir=None) -> tuple:
+    """Acquire a named single-instance lock. Returns (ok, message).
+
+    Pure flock semantics: the lock is held until _release_lock() or process
+    exit (the kernel releases flock on close/death, so a dead holder never
+    blocks us; its stale pid file is overwritten on takeover).
+    """
+    if name in _instance_locks:
+        return True, "already held by this process"
+    if not _HAS_FCNTL:
+        return True, "no flock support on this platform, guard skipped"
+    path = _lock_path(name, lock_dir)
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    except Exception:
+        pass
+    for _ in range(5):
+        try:
+            fp = open(path, "a+")
+        except Exception as e:
+            return False, f"cannot open lock file {path}: {e}"
+        try:
+            fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
+            # Held by someone: only a live bridge process blocks us.
+            pid = _read_lock_pid(path)
+            fp.close()
+            if _lock_owner_alive(pid):
+                return False, f"already running (pid={pid}); stop it first or use another port"
+            # Stale or mid-startup owner: wait and retry, then give up loudly.
+            time.sleep(0.1)
+            continue
+        try:
+            fp.seek(0)
+            fp.truncate()
+            fp.write(str(os.getpid()))
+            fp.flush()
+        except Exception:
+            pass
+        _instance_locks[name] = fp
+        return True, f"locked ({path})"
+    return False, "lock contention, another instance is starting; retry"
+
+
+def _release_lock(name: str):
+    fp = _instance_locks.pop(name, None)
+    if fp is None:
+        return
+    try:
+        if _HAS_FCNTL:
+            fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        fp.close()
+    except Exception:
+        pass
+
+
+def _release_all_locks():
+    for name in list(_instance_locks):
+        _release_lock(name)
 
 
 def _tcp_announce(text: str, skip=()):
@@ -573,7 +712,19 @@ def _pending_consume(data: bytes) -> bytes:
 # ============================================================
 def open_serial(port: str, baudrate: int, timeout: float = 0.1,
                 bytesize: int = 8, parity: str = 'N', stopbits: float = 1) -> bool:
-    global serial_conn
+    global serial_conn, _serial_lock_port, _last_open_error
+    if not port:
+        _last_open_error = "no port given"
+        return False
+    # One bridge per serial port: two processes opening the same tty would
+    # split incoming bytes between their reader threads (lost responses).
+    lock_name = _serial_lock_name(port)
+    held_before = lock_name in _instance_locks
+    ok, msg = _acquire_lock(lock_name)
+    if not ok:
+        _last_open_error = msg
+        log(f"[ERR] Serial {port} busy: {msg}")
+        return False
     try:
         log(f"[SYS] Opening {port} @ {baudrate} ...")
         with serial_lock:
@@ -583,18 +734,23 @@ def open_serial(port: str, baudrate: int, timeout: float = 0.1,
                 port=port, baudrate=baudrate, timeout=timeout,
                 write_timeout=1, bytesize=bytesize, parity=parity, stopbits=stopbits,
             )
+        _serial_lock_port = port
+        _last_open_error = ""
         log(f"[SYS] Opened {port} @ {baudrate}")
         _pending_clear()  # On reconnect, drop leftover echo expectations and buffered reads from last time
         return True
     except Exception as e:
+        _last_open_error = str(e)
         log(f"[ERR] Failed to open {port}: {e}")
+        if not held_before:
+            _release_lock(lock_name)  # don't squat a port we never opened
         # The old connection was closed above; no stale echo/buffered reads may leak into the next one
         _pending_clear()
         return False
 
 
 def close_serial():
-    global serial_conn
+    global serial_conn, _serial_lock_port
     closed = False
     with serial_lock:
         if serial_conn and serial_conn.is_open:
@@ -602,6 +758,9 @@ def close_serial():
             closed = True
     if closed:
         log("[SYS] Serial closed")
+    if _serial_lock_port is not None:
+        _release_lock(_serial_lock_name(_serial_lock_port))  # hand the port to whoever needs it next
+        _serial_lock_port = None
     _pending_clear()
 
 
@@ -754,18 +913,23 @@ def serial_reader():
 # ============================================================
 # TCP bridge: for (human) users via PuTTY/telnet
 # ============================================================
-def tcp_bridge(listen_host: str, listen_port: int):
+def _bind_tcp_socket(listen_host: str, listen_port: int):
+    """Create, bind and listen on the user TCP port. Raises on failure.
+
+    Binding happens in the main thread so a conflict fails fast (loud exit)
+    instead of leaving a headless MCP-only process while the user stays
+    connected to an orphaned previous instance.
+    """
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        srv.bind((listen_host, listen_port))
-    except Exception as e:
-        log(f"[ERR] Cannot bind TCP {listen_host}:{listen_port} - {e}")
-        return
+    srv.bind((listen_host, listen_port))
     srv.listen(10)
     srv.settimeout(0.5)  # So accept() unblocks when running=False for a clean shutdown
-    log(f"[SYS] TCP bridge listening for users on {listen_host}:{listen_port} ...")
+    return srv
 
+
+def tcp_serve(srv):
+    """Accept loop for an already-bound TCP socket (runs in a daemon thread)."""
     try:
         while running:
             try:
@@ -1347,7 +1511,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                          stopbits=arguments.get("stopbits", 1))
         if ok:
             return _text(f"Connected to {arguments['port']} @ {arguments.get('baudrate', 115200)} (shared by all AIs/users)")
-        return _text(f"Cannot connect to {arguments.get('port')}; check that it exists, permissions, and availability")
+        return _text(f"Cannot connect to {arguments.get('port')}; {_last_open_error or 'check that it exists, permissions, and availability'}")
 
     elif name == "serial_disconnect":
         close_serial()
@@ -1428,6 +1592,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         edit_state = "cooked" if cooked_mode else "raw"
         with log_fp_lock:
             log_state = f"{log_name} ({log_owner})" if log_fp is not None else "not recording"
+        locks_state = ", ".join(sorted(_instance_locks)) or "none"
         if info is not None:
             port, baud, bytesize, parity, stopbits, in_waiting = info
             return _text(f"Serial status:\n  Port: {port}\n  Baud: {baud}\n"
@@ -1438,10 +1603,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                          f"  TCP history replay: {tcp_hist_state}\n"
                          f"  Log: {log_state}\n"
                          f"  Line editing: {edit_state}\n"
-                         f"  TCP users: {n_tcp}")
+                         f"  TCP users: {n_tcp}\n"
+                         f"  Bridge pid: {os.getpid()} (locks: {locks_state})")
         return _text(f"Serial not connected\n  RX buffer: {n_rx_bytes} bytes / {n_rx_chunks} chunks\n"
                      f"  History: {hist_state}\n  TCP history replay: {tcp_hist_state}\n  Log: {log_state}\n"
-                     f"  Line editing: {edit_state}\n  TCP users: {n_tcp}")
+                     f"  Line editing: {edit_state}\n  TCP users: {n_tcp}\n"
+                     f"  Bridge pid: {os.getpid()} (locks: {locks_state})")
 
     elif name == "serial_list_ports":
         from serial.tools.list_ports import comports
@@ -1520,11 +1687,35 @@ def run_stdio():
     anyio.run(_serve)
 
 
+def _handle_sigint(signum, frame):
+    """Ctrl+C: raise KeyboardInterrupt so main's shutdown path runs.
+
+    Installed before anyio.run (which only overrides a *default* SIGINT
+    handler): anyio's cancel-based Ctrl+C hangs forever on the stdin reader
+    task blocked in a non-cancellable read; unwinding to
+    except KeyboardInterrupt -> os._exit cannot hang.
+    """
+    raise KeyboardInterrupt
+
+
+def _handle_sigterm(signum, frame):
+    """SIGTERM graceful shutdown: unwind run_stdio() so finally releases everything.
+
+    Raising (rather than closing stdin: close() does not unblock a reader
+    thread already blocked in read() on Linux) lets anyio cancel its tasks;
+    main's finally still closes serial/TCP/locks.
+    """
+    log("[SYS] Got SIGTERM, shutting down...")
+    global running
+    running = False
+    raise SystemExit(0)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Serial Broadcast Bridge MCP Server - human/AI shared COM port")
     parser.add_argument("--port", "-p", help="Serial port, e.g. COM3 or /dev/ttyUSB0")
     parser.add_argument("--baud", "-b", type=int, default=115200, help="Baud rate")
-    parser.add_argument("--tcp", "-t", type=int, default=7001, help="User TCP/telnet port (default 7001)")
+    parser.add_argument("--tcp", "-t", type=int, default=7001, help="User TCP/telnet port (default 7001; 0 disables the TCP bridge, MCP only)")
     parser.add_argument("--tcphost", default="127.0.0.1",
                         help="TCP bind IP (for users; default 127.0.0.1, localhost only. 0.0.0.0 exposes it to the LAN where anyone could inject serial commands)")
     parser.add_argument("--auto-connect", action="store_true", help="Auto-connect the serial port on startup")
@@ -1556,11 +1747,42 @@ def main():
             print(f"[ERR] Cannot open log file {args.log_file}: {e}", file=sys.stderr)
             log_fp = None
 
+    try:
+        if signal.getsignal(signal.SIGTERM) is not signal.SIG_IGN:
+            signal.signal(signal.SIGTERM, _handle_sigterm)
+        # Install before anyio.run (which only overrides a *default* SIGINT
+        # handler): anyio's cancel-based Ctrl+C hangs forever on the stdin
+        # reader task blocked in a non-cancellable read; ours unwinds to
+        # except KeyboardInterrupt -> os._exit. An inherited SIG_IGN is
+        # respected; anything else (default handler or SIG_DFL) is ours.
+        if signal.getsignal(signal.SIGINT) in (signal.default_int_handler, signal.SIG_DFL):
+            signal.signal(signal.SIGINT, _handle_sigint)
+    except Exception:
+        pass
+
+    # Single-instance guard + fail-fast bind, all in the main thread: a second
+    # bridge on the same TCP endpoint or serial port exits loudly instead of
+    # running headless while the user stays connected to the orphaned first one.
+    tcp_srv = None
+    if args.tcp != 0:
+        ok, msg = _acquire_lock(_tcp_lock_name(args.tcphost, args.tcp))
+        if not ok:
+            print(f"[ERR] Cannot start TCP bridge {args.tcphost}:{args.tcp}: {msg}", file=sys.stderr, flush=True)
+            sys.exit(1)
+        try:
+            tcp_srv = _bind_tcp_socket(args.tcphost, args.tcp)
+        except Exception as e:
+            print(f"[ERR] Cannot bind TCP {args.tcphost}:{args.tcp} - {e}", file=sys.stderr, flush=True)
+            _release_all_locks()
+            sys.exit(1)
+
     _emit("=" * 62)
     _emit(" Serial Broadcast Bridge MCP Server (stdio)")
+    _emit(f"  Pid    : {os.getpid()}")
     _emit(f"  Serial : {args.port or '(unset; use serial_connect)'} @ {args.baud}")
-    _emit(f"  User   : telnet/raw {args.tcphost}:{args.tcp}")
+    _emit(f"  User   : {'(TCP bridge disabled, MCP only)' if args.tcp == 0 else f'telnet/raw {args.tcphost}:{args.tcp}'}")
     _emit("  Both sides share the connection; actions and device responses are broadcast to everyone")
+    _emit("  Single-instance: second bridge on the same TCP endpoint / serial port exits (no silent headless mode)")
     _emit(f"  History: {'disabled (--no-history, live broadcast unaffected)' if args.no_history else 'enabled'}")
     _emit(f"  TCP history replay: {'off (--no-tcp-history, new connections get no backlog; AI can still query)' if args.no_tcp_history else 'on'}")
     _emit(f"  Line ending: {args.line_ending} {LINE_ENDINGS[args.line_ending]!r}")
@@ -1576,16 +1798,35 @@ def main():
         open_serial(args.port, args.baud)
 
     threading.Thread(target=serial_reader, daemon=True).start()
-    threading.Thread(target=tcp_bridge, args=(args.tcphost, args.tcp), daemon=True).start()
+    if tcp_srv is not None:
+        threading.Thread(target=tcp_serve, args=(tcp_srv,), daemon=True).start()
 
     try:
+        shutdown_code = 0
         run_stdio()
     except KeyboardInterrupt:
         running = False
         log("[SYS] Got Ctrl+C, shutting down...")
+        shutdown_code = 130
+    except SystemExit as e:
+        # Raised by _handle_sigterm: anyio is unwound, but its non-daemon
+        # stdin worker may still block on read(), so exit via os._exit below.
+        running = False
+        shutdown_code = e.code if isinstance(e.code, int) else 0
+    except Exception as e:
+        # Parent went away / stdio EOF: don't linger as an orphan holding the port.
+        running = False
+        log(f"[SYS] MCP channel closed ({e!r}), shutting down...")
+        shutdown_code = 0
     finally:
         running = False
+        try:
+            if tcp_srv is not None:
+                tcp_srv.close()
+        except Exception:
+            pass
         close_serial()
+        _release_all_locks()
         log("[SYS] Closed")
         if log_fp is not None:
             try:
@@ -1593,6 +1834,11 @@ def main():
                     log_fp.close()
             except Exception:
                 pass
+        # Hard exit: anyio's non-daemon stdin worker thread can block in
+        # read() forever (stdin still open), which would wedge interpreter
+        # shutdown in threading._shutdown join. All cleanup is done above,
+        # streams are unbuffered/flushed, so nothing is lost.
+        os._exit(shutdown_code)
 
 
 if __name__ == "__main__":
